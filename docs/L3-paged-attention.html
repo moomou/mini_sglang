@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L3 — Paged attention kernel · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+  </nav>
+</header>
+<main>
+  <h1>L3 — Paged attention kernel</h1>
+  <p class="meta">Block-table-aware attention. Stop gathering on the host; let the kernel walk the page table.</p>
+
+  <h2>3.1 Why L2 hits a wall</h2>
+  <p>L2's attention reads its history with a host-side gather:</p>
+  <pre><code>K_full = pool.K[layer][meta.kv_indices]   # gather, shape [T_kv, H_kv, D]</code></pre>
+  <p>Two problems:</p>
+  <ol>
+    <li><b>HBM traffic and intermediate allocation.</b> For Qwen3-8B at 1k context, that's roughly <code>1024 × 8 × 128 × 2B × 36 × 2 ≈ 144 MiB</code> shuffled per <em>step</em>. Linear in batch size and context.</li>
+    <li><b>Can't represent multiple sequences in one kernel call.</b> A flat <code>kv_indices</code> can't say "query <em>q</em> attends only to keys 3..14 of <em>its</em> sequence". You'd need expensive boolean masks.</li>
+  </ol>
+  <p>The fix: keep storage paged but pass the kernel <b>structural metadata</b> describing where each sequence lives, then call the kernel <em>once</em> for the whole batch.</p>
+
+  <h2>3.2 The three metadata tensors</h2>
+  <p>Memorize these — every paged attention kernel takes them.</p>
+  <pre><code>cu_seqlens_q : [num_seqs + 1]   prefix-sum of query lengths (starts at 0)
+seq_lens_kv  : [num_seqs]       total cached length per sequence
+block_table  : [num_seqs, max_blocks_per_seq]   per-seq page table (right-padded)</code></pre>
+  <p>Examples:</p>
+  <table>
+    <tr><th>scenario</th><th>cu_seqlens_q</th><th>seq_lens_kv</th><th>block_table</th></tr>
+    <tr><td>single-seq prefill of N</td><td>[0, N]</td><td>[N]</td><td>[[b0, b1, …]]</td></tr>
+    <tr><td>single-seq decode at step i</td><td>[0, 1]</td><td>[N+i+1]</td><td>[[b0, b1, …]]</td></tr>
+    <tr><td>two-seq mixed (A: decode, B: prefill chunk)</td><td>[0, 1, 1+chunk_B]</td><td>[len_A, len_B]</td><td>[[A_blocks…], [B_blocks…]]</td></tr>
+  </table>
+  <p>Query token at position <code>q</code> within sequence <code>s</code> attends to keys <code>0 .. seq_lens[s] − q_len[s] + q</code> of sequence <code>s</code> only. Inter-sequence attention is structurally impossible — exactly what we want for batching.</p>
+
+  <h2>3.3 Storage layout switch — block-tensor</h2>
+  <p>Reshape each layer's K, V from <code>[num_slots, H_kv, D]</code> (token-flat) to <code>[num_blocks, block_size, H_kv, D]</code> (block-tensor). Same bytes, different addressing. The block dim is what kernels expect for paged reads.</p>
+
+  <h3>The view trick that makes <code>set_kv</code> work</h3>
+  <div class="diagram">
+Pool tensor (per layer)              slot_mapping (per token)
+shape: [num_blocks, block_size, H_kv, D]    shape: [T]
+       └──┬───┘   └────┬────┘  └─┬─┘ └┬┘    e.g. [5, 6, 7, 21, 22, 23]
+          │            │         │    │     ← FLAT token indices
+       which       which slot   how  per-
+       block       INSIDE the   many head
+                   block        KV   dim
+                                heads
+
+PyTorch fancy indexing rule:
+   pool.K[layer][slot_mapping]  selects along axis 0 = num_blocks
+   → interprets [5,6,7] as BLOCK ids → wrong shape, garbage writes
+  </div>
+
+  <p>Fix with a zero-copy reshape:</p>
+  <pre><code>def set_kv(self, layer_id, slot_mapping, k, v):
+    K = self.K[layer_id].view(-1, self.num_kv_heads, self.head_dim)  # [N*B, H_kv, D]
+    V = self.V[layer_id].view(-1, self.num_kv_heads, self.head_dim)
+    K[slot_mapping] = k
+    V[slot_mapping] = v</code></pre>
+
+  <div class="diagram">
+Same bytes, two views:
+
+   [N*B, H, D]        ←  view used for SCATTER (writes per token)
+                          indexed by slot_mapping[T] from BlockAllocator
+
+   [N, B, H, D]       ←  original used for GATHER  (reads per block)
+                          indexed by block_table[S, max_b] from req.blocks
+  </div>
+  <p>The flat coordinate <code>flat = block_id × block_size + within</code> is exactly what <code>BlockAllocator</code> already produces in <code>req.slot_indices</code>. No translation math, just a view to match.</p>
+
+  <h2>3.4 Two implementation paths</h2>
+
+  <h3>Path A — Pure PyTorch reference (no install)</h3>
+  <p>For each sequence, do per-seq gather → SDPA. Same correctness as a real kernel, just no fusion. Use this to validate your metadata is shaped right.</p>
+  <pre><code>def attn_paged_torch(q, K_cache, V_cache, meta, *, H_q, H_kv):
+    outputs = []
+    num_seqs = meta.cu_seqlens_q.numel() - 1
+    for s in range(num_seqs):
+        q_start = meta.cu_seqlens_q[s].item()
+        q_end   = meta.cu_seqlens_q[s+1].item()
+        q_len   = q_end - q_start
+        kv_len  = meta.seq_lens_kv[s].item()
+
+        n_blocks  = (kv_len + meta.block_size - 1) // meta.block_size
+        block_ids = meta.block_table[s, :n_blocks]
+        K_seq = K_cache[block_ids].reshape(-1, H_kv, K_cache.shape[-1])[:kv_len]
+        V_seq = V_cache[block_ids].reshape(-1, H_kv, V_cache.shape[-1])[:kv_len]
+
+        if H_q != H_kv:
+            K_seq = K_seq.repeat_interleave(H_q // H_kv, dim=1)
+            V_seq = V_seq.repeat_interleave(H_q // H_kv, dim=1)
+
+        Q_s = q[q_start:q_end].transpose(0,1).unsqueeze(0)   # [1, H, q_len, D]
+        K_s = K_seq.transpose(0,1).unsqueeze(0)
+        V_s = V_seq.transpose(0,1).unsqueeze(0)
+        out_s = F.scaled_dot_product_attention(
+            Q_s, K_s, V_s,
+            is_causal=bool(q_len == kv_len),
+            dropout_p=0.0,
+        )
+        outputs.append(out_s.squeeze(0).transpose(0,1))      # [q_len, H, D]
+    return torch.cat(outputs, dim=0)                          # [T_total_q, H, D]</code></pre>
+
+  <h3>Path B — flash-attn (recommended once installed)</h3>
+  <pre><code>from flash_attn import flash_attn_with_kvcache
+out = flash_attn_with_kvcache(
+    q,                                # [num_seqs, q_len_max, H_q, D]
+    pool.K[layer], pool.V[layer],     # [num_blocks, block_size, H_kv, D]
+    cache_seqlens = meta.seq_lens_kv, # [num_seqs] int32
+    block_table   = meta.block_table, # [num_seqs, max_blocks] int32
+    causal        = True,
+    softmax_scale = 1.0 / math.sqrt(D),
+)</code></pre>
+  <p>Single fused kernel call for the whole batch. Use Path A first to validate, then swap.</p>
+
+  <h2>3.5 Pitfalls</h2>
+  <ol>
+    <li><b><code>block_table</code> dtype.</b> Must be <code>int32</code> for flash-attn; <code>int64</code> raises.</li>
+    <li><b>Tensor scalars where Python ints are needed.</b> <code>cu_seqlens_q[s]</code> and <code>seq_lens_kv[s]</code> are 0-D tensors; call <code>.item()</code> before slicing or arithmetic, and wrap <code>q_len == kv_len</code> in <code>bool(...)</code> for SDPA's <code>is_causal</code>.</li>
+    <li><b>Forgetting the <code>.view()</code> in <code>set_kv</code>.</b> Writes go into the block dim (see 3.3).</li>
+    <li><b><code>is_causal</code> generalisation.</b> Per-sequence form is <code>q_len_i == kv_len_i</code>, the natural extension of L1's <code>T == kv_valid_len</code>.</li>
+    <li><b>Output shape after the loop.</b> <code>attn_paged_torch</code> returns <code>[T, H, D]</code> (token-major). To feed <code>o_proj</code>, just <code>view(T, H*D)</code> — <em>no</em> extra transpose. (Real bug from this lesson — see 3.7.)</li>
+  </ol>
+
+  <h2>3.6 Smoke harness changes</h2>
+  <pre><code># prefill
+N    = prompt_ids.numel()
+reserve(req, alloc, N)
+slot = torch.tensor(req.slot_indices[:N], device='cuda', dtype=torch.long)
+meta = ForwardMeta(
+    positions    = torch.arange(N, device='cuda'),
+    slot_mapping = slot,
+    cu_seqlens_q = torch.tensor([0, N], device='cuda', dtype=torch.int32),
+    seq_lens_kv  = torch.tensor([N],    device='cuda', dtype=torch.int32),
+    block_table  = torch.tensor([req.blocks], device='cuda', dtype=torch.int32),
+    block_size   = alloc.block_size,
+    is_prefill   = True,
+)
+logits = model(prompt_ids, pool, meta)
+
+# decode step i
+reserve(req, alloc, req.cur_len + 1)
+pos = req.cur_len
+slot_new = torch.tensor([req.slot_indices[pos]], device='cuda', dtype=torch.long)
+meta = ForwardMeta(
+    positions    = torch.tensor([pos], device='cuda'),
+    slot_mapping = slot_new,
+    cu_seqlens_q = torch.tensor([0, 1],     device='cuda', dtype=torch.int32),
+    seq_lens_kv  = torch.tensor([pos + 1],  device='cuda', dtype=torch.int32),
+    block_table  = torch.tensor([req.blocks], device='cuda', dtype=torch.int32),
+    block_size   = alloc.block_size,
+    is_prefill   = False,
+)</code></pre>
+
+  <h2>3.7 Q&amp;A from session</h2>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Show me the shape with diagrams — I'm not seeing why <code>.view(-1, H_kv, D)</code> is right.</b>
+  </blockquote>
+  <p>See 3.3 above. Two diagrams: (1) why fancy indexing on the un-viewed tensor selects whole blocks, and (2) the same bytes presented as either <code>[N*B, H, D]</code> for writes or <code>[N, B, H, D]</code> for reads.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>L3 runs end-to-end but token output is garbage ("OwO, the user is asking…"). What's wrong?</b>
+  </blockquote>
+  <p>The diagnostic: divergence at <em>position 0</em> means prefill itself is wrong, not decode. Numeric drift gives "Paris" → "Paris" → some-other-word; total non-sequitur points to a layer-input scramble.</p>
+  <p>Cause: an extra <code>transpose(0, 1)</code> before the flatten in <code>Qwen3Attention.forward</code>:</p>
+  <pre><code># BUG
+out = out.transpose(0, 1).contiguous().view(T, H_q * D)
+# FIX (out is already [T, H, D] from attn_paged_torch)
+out = out.contiguous().view(T, H_q * D)</code></pre>
+  <p>The bad path: shape <code>[T, H, D]</code> → transpose → <code>[H, T, D]</code> → contiguous (memory now head-major) → <code>view(T, H*D)</code> reinterprets the head-major buffer as token-major. Each "row" fed to <code>o_proj</code> is one head's T tokens worth of activations, not one token's H heads. Compounds across 36 layers → "OwO".</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why have both Path A and Path B? Just pick one.</b>
+  </blockquote>
+  <p>Path A is the spec the kernel implements. If your metadata is wrong, both will be wrong, but Path A's bug is in your own loop, easy to print. Path B's bug is inside a kernel — much harder to read. Build Path A first, verify the smoke test passes, <em>then</em> swap to Path B as a one-line substitution.</p>
+
+  <h2>3.8 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L3 pass criteria</span>
+    <code>scripts/l3_smoke.py</code> emits the same 20 token IDs as L1 / L2. Optionally Path B (flash-attn) produces identical output.
+  </blockquote>
+
+  <h2>3.9 What L3 unlocks</h2>
+  <p>The metadata you just built (<code>cu_seqlens_q</code>, <code>seq_lens_kv</code>, <code>block_table</code>) is exactly what L5's scheduler will produce per step from a list of in-flight requests. <em>That's the entire scheduler in one sentence.</em> The hard data-structure work is done; L4 (sampler) and L5 (scheduler) become small surgical additions on top of this skeleton.</p>
+
+  <div class="lesson-nav">
+    <a href="L2-paged-kv.html">← L2</a>
+    <a href="index.html">Home</a>
+  </div>
+</main>
+</body>
+</html>

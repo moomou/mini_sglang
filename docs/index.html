@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>mini_sglang — rebuild an LLM inference engine, lesson by lesson</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+  </nav>
+</header>
+<main>
+  <h1>Rebuilding sglang from scratch</h1>
+  <p class="meta">A curriculum that takes you from an empty Python package to an end-to-end LLM inference server serving Qwen3-8B.</p>
+
+  <p>
+    Each lesson teaches one production-engine concept by having <em>you</em> build it.
+    The author plays host: explains the idea, hands you a design and reference snippets,
+    you implement, then we debug together. The contract is that every lesson keeps the
+    same end-to-end smoke test green: greedy 20-token generation must match Hugging Face
+    transformers token-for-token on the prompt
+    <code>"The capital of France is"</code>.
+  </p>
+
+  <h2>Setup</h2>
+  <pre><code># Blackwell (sm_120, RTX 5090) requires the cu128 PyTorch wheels.
+# pyproject.toml pins torch via [tool.uv.sources] -> pytorch-cu128.
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+cd mini_sglang
+uv venv
+uv sync
+source .venv/bin/activate
+
+python -m scripts.l1_smoke   # verify L1 still passes
+</code></pre>
+
+  <h2>Lessons</h2>
+  <div class="lesson-grid">
+    <a class="lesson-card" href="L0-architecture.html">
+      <span class="num">L0</span>
+      <h3>Architecture overview</h3>
+      <p>What an inference engine actually does, end-to-end. The seven stages every modern engine has.</p>
+      <span class="status done">done</span>
+    </a>
+    <a class="lesson-card" href="L1-model-weights.html">
+      <span class="num">L1</span>
+      <h3>Model &amp; weight loading</h3>
+      <p>Build Qwen3-8B in PyTorch from spec, load HF safetensors, match HF token-for-token on greedy decode.</p>
+      <span class="status done">done</span>
+    </a>
+    <a class="lesson-card" href="L2-paged-kv.html">
+      <span class="num">L2</span>
+      <h3>Paged KV cache</h3>
+      <p>Replace the contiguous KV with a paged pool + block allocator. The data structure that makes batching possible.</p>
+      <span class="status done">done</span>
+    </a>
+    <a class="lesson-card" href="L3-paged-attention.html">
+      <span class="num">L3</span>
+      <h3>Paged attention kernel</h3>
+      <p>Block-table-aware attention. The three metadata tensors every paged kernel takes. Pure-PyTorch and flash-attn paths.</p>
+      <span class="status done">done</span>
+    </a>
+    <a class="lesson-card" href="L4-sampler.html">
+      <span class="num">L4</span>
+      <h3>Sampler</h3>
+      <p>Greedy, temperature, top-k, top-p, repetition penalty — per-row, in the right order.</p>
+      <span class="status done">done</span>
+    </a>
+    <div class="lesson-card" style="opacity:.6">
+      <span class="num">L5</span>
+      <h3>Scheduler / continuous batching</h3>
+      <p>Multiple in-flight requests in one forward pass. Where most of the throughput comes from.</p>
+      <span class="status todo">queued</span>
+    </div>
+    <div class="lesson-card" style="opacity:.6">
+      <span class="num">L6</span>
+      <h3>Tokenizer + incremental detokenize</h3>
+      <p>Streaming text out without re-decoding the whole sequence each step.</p>
+      <span class="status todo">queued</span>
+    </div>
+    <div class="lesson-card" style="opacity:.6">
+      <span class="num">L7</span>
+      <h3>HTTP server</h3>
+      <p>FastAPI + asyncio glue. <code>/generate</code> end-to-end.</p>
+      <span class="status todo">queued</span>
+    </div>
+    <div class="lesson-card" style="opacity:.6">
+      <span class="num">L8</span>
+      <h3>Radix prefix cache <span style="color:var(--muted);font-weight:400">(stretch)</span></h3>
+      <p>Reuse KV across requests with shared prefixes. The defining sglang trick.</p>
+      <span class="status todo">stretch</span>
+    </div>
+    <div class="lesson-card" style="opacity:.6">
+      <span class="num">L9</span>
+      <h3>CUDA graphs decode <span style="color:var(--muted);font-weight:400">(stretch)</span></h3>
+      <p>Replay the decode step at near-zero CPU overhead.</p>
+      <span class="status todo">stretch</span>
+    </div>
+  </div>
+
+  <h2>Reference target</h2>
+  <p>
+    Final goal: <code>python -m mini_sglang.server --model /path/to/Qwen3-8B</code> and
+    <code>curl localhost:8000/generate -d '{"prompt":"...", "max_tokens":64}'</code>
+    serves correct text with sane throughput.
+  </p>
+
+  <p class="footer">mini_sglang teaching curriculum &middot; built alongside <a href="https://github.com/sgl-project/sglang">sgl-project/sglang</a></p>
+</main>
+</body>
+</html>

@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L1 — Model &amp; weight loading · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+  </nav>
+</header>
+<main>
+  <h1>L1 — Model &amp; weight loading</h1>
+  <p class="meta">Build Qwen3-8B from spec, load HF safetensors, match HF token-for-token.</p>
+
+  <h2>1.1 Goal</h2>
+  <p>By the end of this lesson, <code>python -m scripts.l1_smoke</code> prints "L1 PASS" and emits the same 20 tokens as Hugging Face on the same prompt. The KV cache is still a contiguous per-layer tensor (<code>[max_len, H_kv, D]</code>); paging arrives in L2.</p>
+
+  <h2>1.2 Qwen3-8B at a glance</h2>
+  <table>
+    <tr><th>field</th><th>value</th><th>note</th></tr>
+    <tr><td>num_hidden_layers</td><td>36</td><td></td></tr>
+    <tr><td>hidden_size</td><td>4096</td><td></td></tr>
+    <tr><td>intermediate_size (MLP)</td><td>12288</td><td>SwiGLU, no bias</td></tr>
+    <tr><td>num_attention_heads</td><td>32</td><td></td></tr>
+    <tr><td>num_key_value_heads</td><td>8</td><td>GQA, group=4</td></tr>
+    <tr><td>head_dim</td><td>128</td><td></td></tr>
+    <tr><td>RoPE θ</td><td>1e6</td><td>"large theta"</td></tr>
+    <tr><td>rms_norm_eps</td><td>1e-6</td><td></td></tr>
+    <tr><td>tie_word_embeddings</td><td>false</td><td>separate <code>lm_head</code></td></tr>
+    <tr><td>q_norm / k_norm</td><td>per-head</td><td>Qwen3 quirk; applied <em>before</em> RoPE</td></tr>
+    <tr><td>sliding_window</td><td>null</td><td>full attention</td></tr>
+    <tr><td>dtype</td><td>bf16</td><td></td></tr>
+  </table>
+
+  <h2>1.3 Implementation order</h2>
+  <ol>
+    <li><b>RMSNorm.</b> <code>x * rsqrt(mean(x²) + eps) * weight</code>. Compute in fp32, cast back.</li>
+    <li><b>SwiGLU MLP.</b> <code>down(silu(gate(x)) * up(x))</code>. No bias.</li>
+    <li><b>RoPE precompute.</b> <code>inv_freq = 1 / θ ** (arange(0, D, 2) / D)</code>; build <code>cos</code>/<code>sin</code> tables of shape <code>[max_pos, D]</code> using HF's <em>rotate-half</em> layout (<code>cat(freqs, freqs)</code>, NOT interleaved).</li>
+    <li><b>RoPE apply.</b> <code>x * cos + rotate_half(x) * sin</code>, where <code>rotate_half(x) = cat(-x[..., D/2:], x[..., :D/2], dim=-1)</code>.</li>
+    <li><b>Qwen3Attention.</b> Project Q/K/V (no bias), reshape to <code>[T, H, D]</code>, <b>q_norm</b> and <b>k_norm</b> per head, apply RoPE, write to KV cache, gather-then-SDPA.</li>
+    <li><b>Qwen3DecoderLayer.</b> Standard pre-norm: <code>x + attn(norm(x))</code>, <code>x + mlp(norm(x))</code>.</li>
+    <li><b>Qwen3Model.</b> embed → 36 layers → final norm.</li>
+    <li><b>Qwen3ForCausalLM.</b> + <code>lm_head</code>.</li>
+    <li><b>weights.py.</b> Load safetensors shards, remap names, <code>load_state_dict(strict=True)</code>.</li>
+  </ol>
+
+  <h2>1.4 Reference snippets (just the tricky ones)</h2>
+
+  <h3>RMSNorm — cast order matters</h3>
+  <pre><code>class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+    def forward(self, x):
+        in_dtype = x.dtype
+        x32 = x.to(torch.float32)
+        var = x32.pow(2).mean(-1, keepdim=True)
+        x32 = x32 * torch.rsqrt(var + self.eps)
+        # NOTE: weight stays bf16; multiply happens after cast back
+        return self.weight * x32.to(in_dtype)
+</code></pre>
+
+  <h3>RoPE precompute — the parens trap</h3>
+  <pre><code>def precompute_rope_cache(D, max_pos, base=1e6, device="cuda", dtype=torch.bfloat16):
+    arange = torch.arange(0, D, 2, device=device, dtype=torch.float32)
+    # CORRECT: base ** (arange / D)
+    inv_freq = 1.0 / (base ** (arange / D))
+    t = torch.arange(max_pos, device=device, dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)        # [max_pos, D/2]
+    emb   = torch.cat((freqs, freqs), dim=-1)           # [max_pos, D]   rotate-half layout
+    return emb.cos().to(dtype), emb.sin().to(dtype)
+</code></pre>
+  <blockquote class="warn">
+    <span class="label">pitfall</span>
+    Python evaluates <code>base ** arange / D</code> as <code>(base ** arange) / D</code>.
+    Without the inner parens, <code>inv_freq[0] ≈ 1/base ≠ 1</code> and your positional encoding is hilariously wrong.
+    This bit us at L1 debug; the model produced sensible token 0 (RoPE doesn't matter at pos 0) and garbage from token 1 onward.
+  </blockquote>
+
+  <h3>Qwen3Attention — quirks</h3>
+  <pre><code>q = self.q_proj(x).view(T, H_q, D)
+k = self.k_proj(x).view(T, H_kv, D)
+v = self.v_proj(x).view(T, H_kv, D)
+
+# Qwen3-specific: per-head RMSNorm BEFORE rope
+q = self.q_norm(q)
+k = self.k_norm(k)
+
+q, k = apply_rope(q, k, cos[positions], sin[positions])
+
+# write to contiguous KV (L1) — paged in L2
+K_cache[layer, kv_write_offset : kv_write_offset + T] = k
+V_cache[layer, kv_write_offset : kv_write_offset + T] = v
+K = K_cache[layer, :kv_valid_len]
+V = V_cache[layer, :kv_valid_len]
+
+# GQA: repeat KV heads to match Q heads
+if H_q != H_kv:
+    K = K.repeat_interleave(H_q // H_kv, dim=1)
+    V = V.repeat_interleave(H_q // H_kv, dim=1)
+
+# is_causal only when T == kv_valid_len (prefill, no prior cache)
+is_prefill = (T == kv_valid_len)
+out = F.scaled_dot_product_attention(
+    Q.transpose(0,1).unsqueeze(0), K.transpose(0,1).unsqueeze(0), V.transpose(0,1).unsqueeze(0),
+    is_causal=is_prefill, dropout_p=0.0,
+).squeeze(0).transpose(0,1)
+</code></pre>
+
+  <h2>1.5 Q&amp;A from session</h2>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why is <code>is_prefill = (T == kv_valid_len)</code> true?</b>
+  </blockquote>
+  <p>It's true <em>by caller convention</em>. Two cases:</p>
+  <table>
+    <tr><th>step</th><th>T (queries this call)</th><th>kv_valid_len (total cached)</th><th>is_prefill</th></tr>
+    <tr><td>prefill of N-token prompt</td><td>N</td><td>N (we just wrote N)</td><td>true</td></tr>
+    <tr><td>decode step i</td><td>1</td><td>N + i</td><td>false</td></tr>
+  </table>
+  <p>So <code>T == kv_valid_len</code> is shorthand for "this batch's queries cover the entire history". When it's true, SDPA's built-in causal mask is the right mask. When it's false, the new token attends to all history (no mask).</p>
+  <blockquote class="hint">
+    <span class="label">student push-back</span>
+    "This only works because we pass <code>kv_valid_len = T</code> during prefill. It's a coupling smell."
+  </blockquote>
+  <p>Correct instinct. The cleaner formulation is per-sequence: <code>q_len_i == kv_len_i</code>. We'll switch to that representation in L3 once <code>cu_seqlens</code>/<code>seq_lens</code> exist. For L1's contiguous, single-sequence case, the boolean is fine and it removes one parameter from the forward signature.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>How does the KV cache actually help? What computation did we save?</b>
+  </blockquote>
+  <p>At decode step <code>i</code> with history length <code>L = N + i</code>, <em>without</em> the cache, you'd recompute K and V for <em>all</em> <code>L</code> positions (because each position's K, V depends only on its hidden state at that layer, but you'd have to recompute the hidden states too). With the cache:</p>
+  <ul>
+    <li>Q/K/V projections only run on <b>1 token</b> (the new one), not <code>L</code>.</li>
+    <li>Attention reads K/V for <code>L</code> tokens but only multiplies them against 1 query row.</li>
+    <li>MLP runs on 1 token instead of <code>L</code>.</li>
+  </ul>
+  <p>FLOPs/token/layer for Qwen3-8B (4096 hidden, 12288 MLP, 32 heads, 128 head_dim):</p>
+  <pre><code>  Per-token compute (decode with cache):  ~234 MFLOPs  / token / layer
+  Per-step recompute (no cache, L=1024):   ~234 MFLOPs * 1024  ≈ 240 GFLOPs / step / layer
+  Speedup at L=1024: ~1024×                  (roughly: linear in context length)
+</code></pre>
+  <p>The KV cache turns generation from O(L²) per step into O(L) per step. The whole reason "fast inference" is even feasible.</p>
+
+  <h2>1.6 The smoke harness</h2>
+  <p>Loading both your model and HF simultaneously OOMs on a 24-32 GiB GPU (Qwen3-8B bf16 ≈ 16 GiB each). Load sequentially:</p>
+  <pre><code>def run_ours(prompt_ids):
+    model = load_model(MODEL_DIR); model.eval()
+    out = our_greedy(model, prompt_ids, N_NEW).cpu()
+    del model
+    gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+    return out
+
+def run_hf(prompt_ids):
+    hf = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=torch.bfloat16).cuda().eval()
+    hf_out = hf.generate(prompt_ids[None], do_sample=False, max_new_tokens=N_NEW)
+    out = hf_out[0, prompt_ids.numel():].cpu()
+    del hf, hf_out
+    gc.collect(); torch.cuda.empty_cache(); torch.cuda.synchronize()
+    return out
+</code></pre>
+
+  <h2>1.7 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L1 pass criteria</span>
+    <code>our_ids == hf_ids</code> bit-equal for 20 greedy tokens on
+    <code>"The capital of France is"</code>.
+    Expected:
+    <code>[12095, 13, 576, 6722, 315, 9625, 374, 12095, 13, 576, 6722, 315, 9625, 374, 12095, 13, 576, 6722, 315, 9625]</code>
+    → "Paris. The capital of France is Paris. The capital of France is Paris. The capital of France".
+  </blockquote>
+
+  <h2>1.8 Debug log (real bugs we hit)</h2>
+  <ul>
+    <li><b>RoPE precompute parens.</b> See 1.4 above. Symptom: token 0 OK, all later tokens wrong. Lesson: when math drops to fp32 from a paper, parenthesize the exponent.</li>
+    <li><b>RMSNorm cast order.</b> Multiplying <code>weight.to(fp32) * x32</code> and then casting back is <em>not</em> the same as <code>weight * x32.to(in_dtype)</code> for HF parity. Match HF's order.</li>
+    <li><b>VRAM blowup.</b> Sequential loading required.</li>
+  </ul>
+
+  <div class="lesson-nav">
+    <a href="L0-architecture.html">← L0</a>
+    <a href="L2-paged-kv.html">L2 — Paged KV cache →</a>
+  </div>
+</main>
+</body>
+</html>

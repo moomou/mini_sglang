@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L2 — Paged KV cache · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+  </nav>
+</header>
+<main>
+  <h1>L2 — Paged KV cache</h1>
+  <p class="meta">Replace contiguous KV with a pool + block allocator. The data structure that makes batching possible.</p>
+
+  <h2>2.1 Why paging</h2>
+  <p>The L1 KV is one big contiguous tensor per layer of shape <code>[max_seq_len, H_kv, D]</code>. That works for one request, but:</p>
+  <ul>
+    <li>Pre-allocates <code>max_seq_len</code> per request, even when most stop at 50 tokens.</li>
+    <li>Can't represent multiple requests in one tensor without padding to the longest one.</li>
+    <li>Can't release memory until the request is fully done.</li>
+  </ul>
+  <p>A paged pool fixes all three. KV memory is sliced into fixed-size <b>blocks</b> (16 tokens each). A request that has 73 tokens of history holds <code>ceil(73/16) = 5</code> blocks; when it finishes, those 5 blocks return to a free list. New requests grab any free block, anywhere.</p>
+
+  <h2>2.2 Storage choice: token-flat vs block-tensor</h2>
+  <p>Two equivalent ways to lay out the pool:</p>
+  <table>
+    <tr><th></th><th>token-flat (this lesson)</th><th>block-tensor (L3+)</th></tr>
+    <tr><td>per-layer shape</td><td><code>[num_slots, H_kv, D]</code></td><td><code>[num_blocks, block_size, H_kv, D]</code></td></tr>
+    <tr><td>indexed by</td><td>flat slot id</td><td>(block_id, within)</td></tr>
+    <tr><td>writes</td><td>direct: <code>K[slot_mapping] = k</code></td><td>flatten via <code>.view(-1, H_kv, D)</code></td></tr>
+    <tr><td>kernel-friendly?</td><td>requires gather to read history</td><td>kernel walks <code>block_table</code> directly</td></tr>
+  </table>
+  <p>Both layouts use the same number of bytes. We'll use <b>token-flat</b> in L2 (simpler), then switch to <b>block-tensor</b> in L3 when we introduce a paged-aware kernel.</p>
+
+  <h2>2.3 The three classes</h2>
+  <pre><code>class KvPool:
+    """Per-layer K, V tensors. Knows nothing about which slots belong to whom."""
+    def __init__(self, num_layers, num_slots, num_kv_heads, head_dim, dtype, device):
+        self.K = [torch.empty(num_slots, num_kv_heads, head_dim, dtype=dtype, device=device)
+                  for _ in range(num_layers)]
+        self.V = [torch.empty_like(self.K[0]) for _ in range(num_layers)]
+    def set_kv(self, layer, slot_mapping, k, v):
+        self.K[layer][slot_mapping] = k
+        self.V[layer][slot_mapping] = v
+
+class BlockAllocator:
+    """Free-list of block IDs. One global allocator across all requests."""
+    def __init__(self, num_slots, block_size=16):
+        assert num_slots % block_size == 0
+        self.block_size = block_size
+        self.num_blocks = num_slots // block_size
+        self.free_blocks = list(range(self.num_blocks))
+    def alloc_blocks(self, n):
+        if n &gt; len(self.free_blocks):
+            raise RuntimeError("OOM")
+        out = self.free_blocks[-n:]; del self.free_blocks[-n:]
+        return out
+    def free(self, blocks):
+        self.free_blocks.extend(blocks)
+
+@dataclass
+class Request:
+    prompt_ids: list[int]
+    blocks:        list[int] = field(default_factory=list)   # owned block IDs
+    slot_indices:  list[int] = field(default_factory=list)   # flat slot ids derived from blocks
+    cur_len:       int = 0
+    output_ids:    list[int] = field(default_factory=list)
+
+@dataclass
+class ForwardMeta:
+    positions:    torch.Tensor   # [T] int64
+    slot_mapping: torch.Tensor   # [T] int64  — where to WRITE k,v in the pool
+    kv_indices:   torch.Tensor   # [T_kv] int64 — where to READ history
+    is_prefill:   bool
+</code></pre>
+
+  <h2>2.4 The reservation helper</h2>
+  <p>Before each forward call, the request must have enough slots reserved. <code>reserve()</code> grows <code>req.blocks</code> on demand and updates <code>req.slot_indices</code>:</p>
+  <pre><code>def reserve(req: Request, alloc: BlockAllocator, target_len: int):
+    target_blocks = (target_len + alloc.block_size - 1) // alloc.block_size
+    if len(req.blocks) &lt; target_blocks:
+        diff   = target_blocks - len(req.blocks)
+        new_bs = alloc.alloc_blocks(diff)
+        req.blocks.extend(new_bs)
+        for b in new_bs:
+            base = b * alloc.block_size
+            req.slot_indices.extend(range(base, base + alloc.block_size))
+</code></pre>
+  <p>Note the slot index convention: <code>slot = block_id * block_size + within</code>. This is the canonical "flat-token coordinate" we'll keep using through L3+.</p>
+
+  <h2>2.5 What changes in <code>Qwen3Attention.forward</code></h2>
+  <p>Three lines change. The L1 contiguous write/read:</p>
+  <pre><code>K_cache[layer, kv_write_offset:kv_write_offset+T] = k
+V_cache[layer, kv_write_offset:kv_write_offset+T] = v
+K = K_cache[layer, :kv_valid_len]
+V = V_cache[layer, :kv_valid_len]</code></pre>
+  <p>becomes the L2 paged version:</p>
+  <pre><code>pool.set_kv(self.layer_idx, meta.slot_mapping, k, v)
+K = pool.K[self.layer_idx][meta.kv_indices]
+V = pool.V[self.layer_idx][meta.kv_indices]</code></pre>
+  <p>Everything else (q_norm, k_norm, RoPE, GQA repeat, SDPA, o_proj) is unchanged.</p>
+
+  <h2>2.6 Pool sizing</h2>
+  <p>KV bytes per token = <code>2 (K&amp;V) × H_kv × D × layers × dtype_bytes</code>. For Qwen3-8B bf16:</p>
+  <pre><code>2 * 8 * 128 * 36 * 2  =  147_456 bytes  =  144 KiB / token
+
+On a 32 GiB GPU with ~14 GiB free for KV after weights:
+14 * 1024 / 144  ≈  100k token slots possible.
+
+L2 uses NUM_SLOTS = 8192, BLOCK_SIZE = 16  → 512 blocks, plenty for one request.</code></pre>
+
+  <h2>2.7 Smoke harness changes</h2>
+  <p>The L2 driver builds <code>ForwardMeta</code> per call:</p>
+  <pre><code># prefill of N tokens
+reserve(req, alloc, N)
+slot = torch.tensor(req.slot_indices[:N], device='cuda', dtype=torch.long)
+meta = ForwardMeta(
+    positions    = torch.arange(N, device='cuda'),
+    slot_mapping = slot,
+    kv_indices   = slot,            # prefill: write set == read set
+    is_prefill   = True,
+)
+logits = model(prompt_ids, pool, meta)
+
+# decode step i
+reserve(req, alloc, req.cur_len + 1)
+pos      = req.cur_len
+slot_new = torch.tensor([req.slot_indices[pos]], device='cuda', dtype=torch.long)
+kv_idx   = torch.tensor(req.slot_indices[:pos+1], device='cuda', dtype=torch.long)
+meta = ForwardMeta(
+    positions    = torch.tensor([pos], device='cuda'),
+    slot_mapping = slot_new,
+    kv_indices   = kv_idx,
+    is_prefill   = False,
+)
+</code></pre>
+
+  <h2>2.8 Pitfalls (real bugs we hit reviewing the implementation)</h2>
+  <ol>
+    <li><b><code>cur_len = T + 1</code> off-by-one.</b> After prefill, <code>cur_len</code> should be <code>T</code>, not <code>T+1</code>. The token we just argmax'd has not yet had its KV written — that happens on the next decode call.</li>
+    <li><b><code>kv_idx</code> with extra brackets.</b> <code>torch.tensor([[...]])</code> is 2-D and breaks the gather. Want a 1-D tensor.</li>
+    <li><b>Forgetting <code>self.layer_idx</code>.</b> Each <code>Qwen3Attention</code> must stash its layer index, otherwise all 36 layers share slot 0 and you get pure noise.</li>
+    <li><b>Indexing dtype.</b> PyTorch fancy indexing requires <code>int64</code>. Using <code>int32</code> silently misbehaves on CPU and raises on CUDA.</li>
+    <li><b>Allocator typo <code>self.free_block</code> vs <code>self.free_blocks</code>.</b> Free-list grows wrong; only bites in L5 with eviction.</li>
+    <li><b>Class-name drift.</b> The reference says <code>KvPool</code>, dataclass is <code>Request</code>. Earlier drafts had <code>KVPool</code>/<code>Req</code>. Pick one and grep the codebase.</li>
+    <li><b>Dangling debug prints.</b> <code>print("HEY", ...)</code> in <code>qwen3.py</code> attention forward. Strip before benchmarking.</li>
+  </ol>
+
+  <h2>2.9 Q&amp;A from session</h2>
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why use a free-list allocator instead of a bitmap or slab allocator?</b>
+  </blockquote>
+  <p>For a single GPU and ~thousands of blocks, a Python list of free IDs is fine — alloc/free is O(n) amortized but n is small. Real engines use ref-counted block tables (for L8 prefix sharing) or bump-allocator + LRU eviction (for L7+ with overflow). The free-list is the smallest thing that exposes the right interface.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why does <code>set_kv</code> not return anything?</b>
+  </blockquote>
+  <p>It mutates the pool tensor in place. The model never reads the pool from a Python variable; the next attention call gathers via <code>kv_indices</code>. Fewer references = easier for L9 CUDA-graph capture.</p>
+
+  <h2>2.10 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L2 pass criteria</span>
+    <code>scripts/l2_smoke.py</code> emits the same 20 token IDs as L1 / HF.
+  </blockquote>
+
+  <div class="lesson-nav">
+    <a href="L1-model-weights.html">← L1</a>
+    <a href="L3-paged-attention.html">L3 — Paged attention →</a>
+  </div>
+</main>
+</body>
+</html>

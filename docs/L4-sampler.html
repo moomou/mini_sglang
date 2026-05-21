@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L4 — Sampler · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+  </nav>
+</header>
+<main>
+  <h1>L4 — Sampler</h1>
+  <p class="meta">Factor token selection into a real module: greedy, temperature, top-k, top-p, penalties.</p>
+
+  <h2>4.1 Where the sampler lives</h2>
+  <pre><code>logits_full = model(input_ids, pool, meta)         # [T_total, vocab]
+logits      = logits_full[last_token_per_seq]      # [num_seqs, vocab]  ← scheduler picks rows
+next_ids    = sampler(logits, sampling_params)     # [num_seqs]         ← THIS lesson
+req.output_ids.append(next_ids[s])                 # writeback per seq</code></pre>
+
+  <p>Two structural points:</p>
+  <ol>
+    <li>The model returns logits for every token in the packed input. The sampler input is whatever rows the scheduler picks — typically the last token of each sequence: <code>logits[cu_seqlens_q[1:] - 1]</code>. The <code>-1</code> matters because <code>cu_seqlens_q</code> is exclusive-end.</li>
+    <li>The sampler is <b>per-sequence</b>, not per-batch. Different requests carry different temperature, top_p, etc. Parameters must be 1-D tensors of length <code>num_seqs</code>, not scalars.</li>
+  </ol>
+
+  <p>This is the only stateful, per-request thing in the forward path — the rest of the model is a pure tensor function. That's why sampling lives outside the model graph.</p>
+
+  <h2>4.2 The canonical pipeline order</h2>
+  <pre><code>logits ─► penalties ─► / temperature ─► top-k mask ─► top-p mask ─► softmax ─► multinomial
+                                                                       │
+                                                          greedy rows: argmax override
+</code></pre>
+
+  <p>Order is litigated. Common bugs:</p>
+  <ul>
+    <li><b>Softmax before top-k/p</b> — top-p's "cumulative ≤ p" math is wrong because it's truncating a distribution that's already been normalised on a different support.</li>
+    <li><b>Temperature after top-k</b> — top-k is rank-based so the surviving set is unchanged, but the relative probabilities inside the kept set are different than intended.</li>
+    <li><b>Penalties after temperature</b> — penalties are additive/multiplicative logit shifts. Their magnitude is calibrated on raw logits; temperature scaling changes their effective strength.</li>
+  </ul>
+
+  <h2>4.3 Building blocks</h2>
+
+  <h3>A. Greedy</h3>
+  <pre><code>next_id = logits.argmax(dim=-1)   # [num_seqs]</code></pre>
+  <p>Equivalent to <code>temperature == 0</code>. The L3 driver does this inline; the sampler wraps it.</p>
+
+  <h3>B. Temperature (with the divide-by-zero guard)</h3>
+  <pre><code>mask_greedy = (temperature == 0)
+t_safe      = temperature.masked_fill(mask_greedy, 1.0)
+logits      = logits / t_safe.unsqueeze(-1)         # [num_seqs, vocab] / [num_seqs, 1]
+# ...at the end, override greedy rows with argmax
+next_ids = torch.where(mask_greedy, logits.argmax(-1), next_ids)</code></pre>
+  <p>Two reasons not to skip the guard: division by zero gives <code>inf</code>/<code>nan</code>, and even <code>1e-3</code> temperature makes runner-up logits underflow to nan after softmax.</p>
+
+  <h3>C. Top-k</h3>
+  <p>Keep only the top <code>k</code> logits per row; everything else becomes <code>-inf</code>.</p>
+  <pre><code>if k.max() &gt; 0:
+    k_max = int(k.max())
+    topk_vals, topk_idx = logits.topk(k_max, dim=-1)
+    keep = torch.arange(k_max, device=logits.device)[None, :] &lt; k.unsqueeze(-1)
+    new  = torch.full_like(logits, float('-inf'))
+    new.scatter_(-1, topk_idx,
+                 torch.where(keep, topk_vals,
+                             torch.tensor(float('-inf'), device=logits.device)))
+    logits = torch.where((k &gt; 0).unsqueeze(-1), new, logits)</code></pre>
+  <p>Per-row <code>k</code> via <code>topk(max_k)</code> + a "keep only first k[i] of each row" mask. Rows with <code>k=0</code> bypass top-k entirely via the final <code>torch.where</code>.</p>
+
+  <h3>D. Top-p (nucleus)</h3>
+  <p>Keep the smallest set of tokens whose cumulative probability ≥ <code>p</code>.</p>
+  <pre><code>if (p &lt; 1.0).any():
+    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+    sorted_probs = sorted_logits.softmax(dim=-1)
+    cum          = sorted_probs.cumsum(dim=-1)
+
+    remove = cum &gt; p.unsqueeze(-1)
+    # SHIFT RIGHT: the boundary token (the one that pushes past p) must be kept
+    remove[..., 1:] = remove[..., :-1].clone()
+    remove[..., 0]  = False
+
+    # project sorted mask back to vocab order
+    remove_unsorted = torch.empty_like(remove)
+    remove_unsorted.scatter_(-1, sorted_idx, remove)
+    logits = logits.masked_fill(remove_unsorted, float('-inf'))</code></pre>
+  <blockquote class="warn">
+    <span class="label">pitfall</span>
+    The shift-right is not optional. Without it, when the top-prob token is already ≥ p, the mask removes it — and there's nothing left to sample from. Silent OOD.
+  </blockquote>
+
+  <h3>E. Penalties</h3>
+  <pre><code># repetition penalty (multiplicative, HF style)
+if (rep_p != 1.0).any():
+    score = logits.gather(-1, prev_ids)                                 # [N, max_prev]
+    score = torch.where(score &gt; 0,
+                        score / rep_p.unsqueeze(-1),
+                        score * rep_p.unsqueeze(-1))
+    logits.scatter_(-1, prev_ids, score)                                # IN-PLACE</code></pre>
+  <p><code>prev_ids</code> shape contract: <code>[num_seqs, max_prev]</code>. Right-pad with a sentinel (or just repeat the first token) so all rows have the same length. The scatter overwrites; if you pad with valid token ids you'll over-penalise — pad with something inert and mask the gather/scatter, or use frequency-count tensors instead (cleaner mathematically).</p>
+
+  <h3>F. Final draw</h3>
+  <pre><code>probs    = logits.float().softmax(dim=-1)         # cast inside sampler, don't trust caller
+next_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+next_ids = torch.where(mask_greedy, logits.argmax(-1), next_ids)</code></pre>
+  <p>The greedy override is what keeps the smoke test parity with L3 at <code>temperature=0</code>.</p>
+
+  <h2>4.4 Disabled-default sentinels (memorize)</h2>
+  <table>
+    <tr><th>knob</th><th>type</th><th>disabled value</th><th>why</th></tr>
+    <tr><td>temperature</td><td>float</td><td>0.0</td><td>triggers greedy override</td></tr>
+    <tr><td>top_k</td><td>int</td><td>0</td><td>convention: 0 = off</td></tr>
+    <tr><td>top_p</td><td>float</td><td>1.0</td><td>identity — keeps the whole vocab</td></tr>
+    <tr><td>rep_penalty</td><td>float</td><td>1.0</td><td>multiplicative identity</td></tr>
+  </table>
+  <p>If your "disabled" smoke test passes <code>top_p=0.0</code> you've removed the entire vocab; only the greedy override saves you. <code>rep_penalty=0.0</code> multiplies logits by zero — total quality collapse if it ever ran.</p>
+
+  <h2>4.5 Q&amp;A from session</h2>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why does the sampler need per-row tensors and not just scalars?</b>
+  </blockquote>
+  <p>Because once the scheduler (L5) bunches multiple in-flight requests into one batch, request A might want <code>temperature=0</code> (you, debugging) while request B wants <code>temperature=0.7</code> (production user). The whole point of batching is that we run them in one kernel call. So sampling parameters become per-row from day one, even if the L4 smoke uses a single row.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why softmax twice (once for top-p, once for the final draw)?</b>
+  </blockquote>
+  <p>The top-p softmax is a means to an end: it converts logits into a CDF so we can find the nucleus. After we mask logits to <code>-inf</code>, the final softmax over the masked logits gives the correct re-normalised distribution. There's no algebraic way to do it in one step that keeps the masking unbiased.</p>
+
+  <h2>4.6 Implementation review (bugs we hit)</h2>
+  <p>From reviewing the student implementation:</p>
+  <ol>
+    <li><b>Disabled-default sentinels were wrong.</b> Driver passed <code>top_p=0.0</code> and <code>rep_penalty=0.0</code>; correct sentinels are <code>1.0</code> for both. The smoke "passed" only because the greedy override masks the damage.</li>
+    <li><b>Sampler ignored its own argument.</b> <code>rep_penalty</code> was hardcoded to 1.2 inside the sampler instead of reading <code>sample_cfg.rep_penalty</code>.</li>
+    <li><b>Non-inplace scatter.</b> <code>logits.scatter(-1, prev_ids, score)</code> returns a new tensor; the original <code>logits</code> was unchanged. Use <code>scatter_</code>.</li>
+    <li><b><code>prev_ids</code> shape mismatch.</b> Sampler did <code>prev_ids.unsqueeze(-1)</code> to make it 2-D, but the result had <code>num_prev</code> on dim 0 instead of <code>num_seqs</code>. <code>gather</code> raises as soon as <code>num_prev &gt; 1</code>. The contract is <code>[num_seqs, max_prev]</code>, period; the driver should build it as <code>torch.stack(output_ids).unsqueeze(0)</code> for single-seq.</li>
+    <li><b>Top-p always runs.</b> No <code>if (top_p &lt; 1.0).any()</code> short-circuit; pays a full sort even when disabled.</li>
+    <li><b>Softmax precision left to caller.</b> Move <code>.float()</code> inside the sampler so it's not load-bearing on the driver.</li>
+    <li><b>Garbage IDE auto-import</b> at top of smoke (<code>SAMPLE_INPUTS_FILENAME_FORMAT</code>). Delete.</li>
+    <li><b>Wrong pass banner.</b> Smoke prints "L3 PASS" instead of "L4 PASS".</li>
+  </ol>
+
+  <h2>4.7 Implementation order</h2>
+  <ol>
+    <li>Define <code>SamplingParams</code> + per-row tensor packing helper.</li>
+    <li>Greedy-only <code>Sampler.__call__</code>. Wire into smoke. Confirm same 20 IDs as L3.</li>
+    <li>Add temperature with the <code>== 0</code> guard. Re-test at <code>temp=0</code>.</li>
+    <li>Add top-k (and its <code>k=0</code> bypass). Re-test.</li>
+    <li>Add top-p (with shift-right and <code>p&lt;1.0</code> guard). Re-test.</li>
+    <li>Add repetition penalty (with <code>scatter_</code> and <code>rp!=1.0</code> guard). Re-test.</li>
+    <li>Sanity check: at <code>temp=0.7, top_p=0.9, top_k=50</code> over 64 tokens, output should be coherent English. Visual only, no bit-equality.</li>
+  </ol>
+
+  <p>Every step keeps the smoke test as a regression: every disabled default must still produce the L3 output. If any step breaks parity with disabled defaults, an op escaped its <code>if disabled: skip</code> guard.</p>
+
+  <h2>4.8 Pitfalls recap</h2>
+  <table>
+    <tr><th>pitfall</th><th>symptom</th></tr>
+    <tr><td>softmax before top-k/p</td><td>top-p threshold uses wrong distribution; silent quality drop</td></tr>
+    <tr><td><code>temperature == 0</code> not guarded</td><td>nan or all-<code>-inf</code> after first sample</td></tr>
+    <tr><td>top-p without shift-right</td><td>first token can be removed → all-zeros softmax</td></tr>
+    <tr><td>bf16 multinomial</td><td>low-prob tokens collapse, distribution spikier than intended</td></tr>
+    <tr><td>per-row params passed as scalars</td><td>first request's setting silently shared with all</td></tr>
+    <tr><td>non-inplace <code>scatter</code> on logits</td><td>penalty silently does nothing</td></tr>
+    <tr><td><code>top_p=0</code> or <code>rep_penalty=0</code> as "disabled"</td><td>wrong sentinels; greedy override hides the bug</td></tr>
+  </table>
+
+  <h2>4.9 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L4 pass criteria</span>
+    <ul style="margin:.4rem 0">
+      <li><code>scripts/l4_smoke.py</code> greedy path produces the same 20 IDs as L1/L2/L3.</li>
+      <li><code>Sampler</code> accepts per-row <code>temperature</code>, <code>top_k</code>, <code>top_p</code>, <code>rep_penalty</code>.</li>
+      <li>Each disabled-default setting individually preserves bit-equality.</li>
+      <li>At <code>temp=0.7, top_p=0.9, top_k=50</code> for 64 tokens, output is coherent English.</li>
+    </ul>
+  </blockquote>
+
+  <p>When this passes, L5 (scheduler) becomes "build <code>cu_seqlens_q</code>, <code>seq_lens_kv</code>, <code>block_table</code>, <code>slot_mapping</code>, and the per-row sampling params from a list of in-flight <code>Request</code> objects every step". Mechanical.</p>
+
+  <div class="lesson-nav">
+    <a href="L3-paged-attention.html">← L3</a>
+    <a href="index.html">Home</a>
+  </div>
+</main>
+</body>
+</html>

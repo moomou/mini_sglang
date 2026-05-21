@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L0 — Architecture overview · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+  </nav>
+</header>
+<main>
+  <h1>L0 — Architecture overview</h1>
+  <p class="meta">What an LLM inference engine actually does, end-to-end.</p>
+
+  <h2>0.1 The seven things every serving engine does</h2>
+  <p>An LLM inference server is a pipeline. Forget any single buzzword you've read; concretely, when a request hits the server, this is what happens:</p>
+  <ol>
+    <li><b>Tokenize.</b> Bytes → token IDs.</li>
+    <li><b>Schedule.</b> Decide which requests run in this forward step (and how many tokens of each).</li>
+    <li><b>Allocate KV cache slots.</b> Reserve room in the paged KV pool for the new tokens.</li>
+    <li><b>Forward pass.</b> Run the model. Reads &amp; writes the KV pool through a paged attention kernel.</li>
+    <li><b>Sample.</b> Convert logits → one new token per active request.</li>
+    <li><b>Detokenize incrementally.</b> Token IDs → streamable text fragments.</li>
+    <li><b>Emit / stream / repeat.</b> Push fragments to clients; loop step 2.</li>
+  </ol>
+  <p>Everything else (radix cache, speculative decoding, CUDA graphs, EP/TP/PP, hicache, etc.) is an optimization on top of this skeleton.</p>
+
+  <h2>0.2 Module map for mini_sglang</h2>
+  <pre><code>mini_sglang/
+├── config.py            # ModelConfig.from_pretrained
+├── weights.py           # safetensors → torch state dict, name remapping
+├── model/
+│   ├── layers.py        # RMSNorm, SwiGLU, RoPE precompute & apply
+│   └── qwen3.py         # Qwen3Attention, DecoderLayer, Model, ForCausalLM
+├── cache/
+│   ├── kv_pool.py       # KvPool: per-layer [num_blocks, block_size, H_kv, D]
+│   ├── block_alloc.py   # BlockAllocator: free-list of block IDs
+│   └── request.py       # Request, ForwardMeta, reserve()
+├── sampler.py           # L4
+├── scheduler.py         # L5
+├── tokenizer.py         # L6
+└── server.py            # L7  (FastAPI)
+scripts/
+├── l1_smoke.py … l9_smoke.py
+</code></pre>
+
+  <h2>0.3 The data structure that ties it all together</h2>
+  <p>If you remember one thing from this curriculum: the central data structure of a modern engine is the <b>paged KV cache + per-step metadata</b>:</p>
+  <div class="diagram">
+KvPool         per layer:  [num_blocks, block_size, H_kv, D]
+                                  (raw HBM, never moved)
+
+Request        per in-flight request:
+                  prompt_ids, output_ids, blocks=[b0, b1, …],
+                  slot_indices=[…], cur_len
+
+ForwardMeta    per forward call:
+                  positions, slot_mapping,                 ← writes
+                  cu_seqlens_q, seq_lens_kv, block_table,  ← reads
+                  block_size
+  </div>
+  <p>The scheduler's job (L5) is to take a list of <code>Request</code> objects and produce one <code>ForwardMeta</code> for the next call. The model never sees a <code>Request</code>; it only consumes the pool + meta.</p>
+
+  <h2>0.4 Why "paged" and not "continuous"?</h2>
+  <p>Naïve per-request KV tensors waste memory: you'd have to pre-allocate <code>[max_len, …]</code> per request even when most are 50 tokens long. Paging lets you allocate KV in fixed-size blocks (16 or 32 tokens) on demand. A request whose history is 73 tokens uses <code>ceil(73/16) = 5</code> blocks, regardless of <code>max_len</code>. The cost is one indirection through a per-request <code>block_table</code> — which the kernel handles natively.</p>
+
+  <h2>0.5 What we will skip (intentionally)</h2>
+  <ul>
+    <li>Distributed (TP/PP/EP/DP). Pure single-GPU.</li>
+    <li>Quantization (FP8/INT4/AWQ).</li>
+    <li>Speculative decoding, draft models, MTP heads.</li>
+    <li>Multi-modality.</li>
+    <li>Beam search, structured generation, logprobs API.</li>
+  </ul>
+  <p>Each of these is at most a focused extension of the skeleton you'll have at L9.</p>
+
+  <h2>0.6 Lesson contract</h2>
+  <blockquote>
+    <span class="label">contract</span>
+    Every lesson keeps <code>scripts/lN_smoke.py</code> green. The smoke test is greedy 20 tokens
+    on the prompt <code>"The capital of France is"</code>, compared bit-for-bit against
+    <code>transformers.AutoModelForCausalLM.generate(do_sample=False)</code>.
+    The expected token IDs are
+    <code>[12095, 13, 576, 6722, 315, 9625, 374, 12095, 13, 576, 6722, 315, 9625, 374, 12095, 13, 576, 6722, 315, 9625]</code>
+    ("Paris. The capital of France is Paris…").
+  </blockquote>
+
+  <div class="lesson-nav">
+    <a href="index.html">← Home</a>
+    <a href="L1-model-weights.html">L1 — Model &amp; weights →</a>
+  </div>
+</main>
+</body>
+</html>

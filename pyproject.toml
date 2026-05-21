@@ -1,0 +1,67 @@
+[project]
+name = "mini-sglang"
+version = "0.0.1"
+description = "MVP rebuild of sglang for learning purposes — single GPU, bf16, Qwen3."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    # --- core numerics ---
+    # Pinned via [tool.uv.sources] below to the cu128 wheel index for Blackwell (RTX 5090, sm_120).
+    "torch>=2.7.0",
+    "numpy>=1.26",
+
+    # --- HF model I/O ---
+    "transformers>=4.51.0",
+    "safetensors>=0.4.5",
+    "tokenizers>=0.20",
+    "huggingface-hub>=0.24",
+    "sentencepiece>=0.2.0",        # some tokenizers need it
+    "protobuf>=4.25",              # ditto
+
+    # --- HTTP server (L7) ---
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.8",
+    "sse-starlette>=2.1",
+
+    # --- dev ergonomics ---
+    "rich>=13.7",
+    "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+# Install with `uv pip install -e ".[flash]"` once you reach Lesson 3.
+# flash-attn requires building against your installed torch+CUDA; it can take ~10 min.
+# For RTX 5090 you want flash-attn >= 2.7.x with Blackwell support.
+flash = ["flash-attn>=2.7.4"]
+
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "ipython>=8.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mini_sglang"]
+
+# --- uv index configuration: pull torch from the CUDA 12.8 wheel index ---
+# RTX 5090 = sm_120 (Blackwell). cu124 wheels do NOT support it.
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
