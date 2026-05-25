@@ -18,5 +18,5 @@ class BlockAllocator:
         del self.free_blocks[-n_blocks:]
         return out
 
-    def free_block_ids(self, blocks):
+    def free(self, blocks):
         self.free_blocks.extend(blocks)

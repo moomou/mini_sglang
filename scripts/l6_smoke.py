@@ -16,6 +16,7 @@ from mini_sglang.cache.kv_pool import KvPool
 from mini_sglang.cache.block_alloc import BlockAllocator
 from mini_sglang.cache.request import Request, ForwardMeta, reserve
 from mini_sglang.sampler import Sampler, SamplingParams
+from mini_sglang.tokenizer import IncrementalDetokenizer, load_tokenizer
 
 MODEL_DIR = pl.Path(os.environ.get("MODEL_DIR", "/media/2nvme/llm/Qwen3-8B"))
 PROMPT = os.environ.get("PROMPT", "The capital of France is")
@@ -26,9 +27,7 @@ BLOCK_SIZE = 16
 
 # scripts/l5_smoke.py — sketch
 PROMPTS = [
-    "The capital of France is",
-    "Once upon a time",
-    "Python is a programming language that",
+    "Write a sentence with some Chinese: 你好世界. And an emoji: 🎉. Done.",
 ]
 
 def _vram(prefix: str) -> None:
@@ -167,22 +166,37 @@ def run_ours(prompts_ids: list[torch.Tensor]) -> tuple[dict[int, list[int]], dic
         pool, 
         eos_id=cfg.eos_token_id)
 
+    tokenizer = load_tokenizer(MODEL_DIR)
+    outputs = defaultdict(list)
+    streams = dict()
     for i, p in enumerate(prompts_ids):
-        scheduler.add_request(Request(
+        detok = IncrementalDetokenizer(tokenizer, p)
+        req = Request(
             id=i, 
             prompt_ids=p,
             sampling_param=dict(temperature=0.0, top_k=0, top_p=1.0, rep_penalty=1.0),
             max_tokens=20,
-        ))
-
-    outputs = defaultdict(list)
+            detok=detok,
+        )
+        scheduler.add_request(req)
+        streams[req.id] = detok
 
     # "server" loop; no pending request yet
+    print("<streaming>")
     while scheduler.has_unfinished():
         res = scheduler.step()
         for rid, tok_id in res.new_tokens.items():
             outputs[rid].append(tok_id)
-        # TODO: process res.finished
+            piece= streams[rid].push(tok_id)
+            if piece:
+                print(piece, end="", flush=True)
+    print("</streaming>")
+    
+
+    print("<flush>")
+    for detok in streams.values():
+        print(detok.flush(), end="", flush=True)
+    print("</flush>")
 
     # compare against single request ref
     param = SamplingParams(

@@ -16,6 +16,9 @@
     <a href="L2-paged-kv.html">L2</a>
     <a href="L3-paged-attention.html">L3</a>
     <a href="L4-sampler.html">L4</a>
+    <a href="L5-scheduler.html">L5</a>
+    <a href="L6-tokenizer.html">L6</a>
+    <a href="L7-server.html">L7</a>
   </nav>
 </header>
 <main>
@@ -76,24 +79,24 @@ python -m scripts.l1_smoke   # verify L1 still passes
       <p>Greedy, temperature, top-k, top-p, repetition penalty — per-row, in the right order.</p>
       <span class="status done">done</span>
     </a>
-    <div class="lesson-card" style="opacity:.6">
+    <a class="lesson-card" href="L5-scheduler.html">
       <span class="num">L5</span>
       <h3>Scheduler / continuous batching</h3>
       <p>Multiple in-flight requests in one forward pass. Where most of the throughput comes from.</p>
-      <span class="status todo">queued</span>
-    </div>
-    <div class="lesson-card" style="opacity:.6">
+      <span class="status done">done</span>
+    </a>
+    <a class="lesson-card" href="L6-tokenizer.html">
       <span class="num">L6</span>
       <h3>Tokenizer + incremental detokenize</h3>
       <p>Streaming text out without re-decoding the whole sequence each step.</p>
-      <span class="status todo">queued</span>
-    </div>
-    <div class="lesson-card" style="opacity:.6">
+      <span class="status done">done</span>
+    </a>
+    <a class="lesson-card" href="L7-server.html">
       <span class="num">L7</span>
       <h3>HTTP server</h3>
       <p>FastAPI + asyncio glue. <code>/generate</code> end-to-end.</p>
-      <span class="status todo">queued</span>
-    </div>
+      <span class="status done">done</span>
+    </a>
     <div class="lesson-card" style="opacity:.6">
       <span class="num">L8</span>
       <h3>Radix prefix cache <span style="color:var(--muted);font-weight:400">(stretch)</span></h3>

@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L7 — HTTP server · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+    <a href="L5-scheduler.html">L5</a>
+    <a href="L6-tokenizer.html">L6</a>
+    <a href="L7-server.html">L7</a>
+  </nav>
+</header>
+<main>
+  <h1>L7 — HTTP server</h1>
+  <p class="meta">FastAPI + SSE streaming. Where mini_sglang stops being a script and starts being a product.</p>
+
+  <h2>7.1 The architectural decision</h2>
+  <p><code>scheduler.step()</code> is a <b>synchronous, GPU-blocking, multi-millisecond function</b>. It launches CUDA kernels and blocks the CPU thread until the sampler's <code>.item()</code> calls sync. asyncio is a <b>single-threaded cooperative event loop</b>. A 30 ms CPU-blocking call freezes the entire server — TCP accepts stall, in-flight responses pause, everything tanks.</p>
+
+  <table>
+    <tr><th>option</th><th>what</th><th>verdict</th></tr>
+    <tr><td>A</td><td>Dedicated engine thread, queues across boundary</td><td>✅ <b>recommended for MVP</b></td></tr>
+    <tr><td>B</td><td><code>run_in_executor(None, scheduler.step)</code></td><td>concurrent calls race the scheduler; basically A done worse</td></tr>
+    <tr><td>C</td><td>Async-native <code>step()</code></td><td>production-grade, weeks of work</td></tr>
+  </table>
+
+  <h2>7.2 The three-component architecture</h2>
+  <div class="diagram">
+┌─────────────────────────────────────────────────────────────────┐
+│  FastAPI process                                                 │
+│                                                                  │
+│  ┌────────────────────────┐    ┌────────────────────────────┐  │
+│  │ asyncio event loop     │    │ Engine thread              │  │
+│  │ ────────────────────── │    │ ────────────────────────── │  │
+│  │ POST /generate handler │    │ while alive:               │  │
+│  │   → make Request       │    │   drain pending_in_q       │  │
+│  │   → put in pending_q   │←──→│   res = scheduler.step()   │  │
+│  │   → await tokens from  │    │   for each (rid, tok):     │  │
+│  │     this_req's queue   │    │     out_qs[rid].put(piece) │  │
+│  │   → yield SSE chunks   │    │   for each finished rid:   │  │
+│  │                        │    │     out_qs[rid].put(None)  │  │
+│  └────────────────────────┘    └────────────────────────────┘  │
+│                                                                  │
+└─────────────────────────────────────────────────────────────────┘
+  </div>
+  <p>Queues:</p>
+  <ul>
+    <li><code>pending_q</code>: thread-safe <code>queue.Queue[GenRequest]</code>. HTTP handlers push; engine drains every step.</li>
+    <li><code>out_q</code> per request: <code>asyncio.Queue[str | None]</code>. Engine thread pushes via <code>loop.call_soon_threadsafe</code>; handler awaits and yields. <code>None</code> = "finished".</li>
+  </ul>
+
+  <h2>7.3 The Engine class</h2>
+  <pre><code>@dataclass
+class GenRequest:
+    req:   Request
+    out_q: asyncio.Queue                  # str pieces; None terminates
+    loop:  asyncio.AbstractEventLoop      # the loop that owns out_q
+
+
+class Engine:
+    def __init__(self, model, sampler, scheduler, tokenizer):
+        self.scheduler  = scheduler
+        self.tokenizer  = tokenizer
+        self.pending_q: queue.Queue[GenRequest] = queue.Queue()
+        self.alive      = threading.Event(); self.alive.set()
+        self.thread     = threading.Thread(target=self._run, daemon=True)
+        self.in_flight: dict[int, GenRequest] = {}
+
+    def start(self):                self.thread.start()
+    def stop (self):                self.alive.clear(); self.thread.join(timeout=5)
+    def submit(self, gen):          self.pending_q.put_nowait(gen)
+
+    def _run(self):
+        while self.alive.is_set():
+            while True:
+                try: gen = self.pending_q.get_nowait()
+                except queue.Empty: break
+                self.in_flight[gen.req.id] = gen
+                self.scheduler.add_request(gen.req)
+
+            if not self.scheduler.has_unfinished():
+                self.alive.wait(timeout=0.005)    # short wait, wakes on stop()
+                continue
+
+            res = self.scheduler.step()
+            for rid, tok in res.new_tokens.items():
+                gen   = self.in_flight[rid]
+                piece = gen.req.detok.push(tok)
+                if piece:
+                    self._send(gen, piece)
+            for rid in res.finished:
+                gen  = self.in_flight.pop(rid)
+                tail = gen.req.detok.flush()
+                if tail: self._send(gen, tail)
+                self._send(gen, None)              # EOS
+
+    def _send(self, gen, item):
+        gen.loop.call_soon_threadsafe(gen.out_q.put_nowait, item)</code></pre>
+
+  <blockquote class="warn">
+    <span class="label">cross-thread async puts</span>
+    <code>loop.call_soon_threadsafe(q.put_nowait, item)</code> is the <b>only</b> safe way to push into an <code>asyncio.Queue</code> from a non-event-loop thread. Direct <code>.put_nowait()</code> from another thread is undefined behaviour in CPython — works 95% of the time, deadlocks at scale.
+  </blockquote>
+
+  <h2>7.4 The FastAPI app</h2>
+  <pre><code>class GenerateBody(BaseModel):
+    prompt:     str
+    max_tokens: int   = 64
+    temperature: float = 0.0
+    top_k:      int   = 0
+    top_p:      float = 1.0
+    rep_penalty: float = 1.0
+    stream:     bool  = True
+
+@asynccontextmanager
+async def lifespan(app):
+    model = load_model(MODEL_DIR); model.eval()
+    cfg   = model.cfg
+    tok   = load_tokenizer(MODEL_DIR)
+    alloc = BlockAllocator(NUM_SLOTS)
+    pool  = KvPool(cfg.num_hidden_layers, alloc.num_blocks, alloc.block_size,
+                   NUM_SLOTS, cfg.num_key_value_heads, cfg.head_dim,
+                   dtype=cfg.dtype, device="cuda")
+    sched = Scheduler(model, Sampler(), alloc, pool, eos_id=cfg.eos_token_id)
+    engine = Engine(model, Sampler(), sched, tok); engine.start()
+    state.update(engine=engine, tokenizer=tok, next_id=count())
+    yield
+    engine.stop()
+
+app = FastAPI(lifespan=lifespan)
+
+@app.post("/generate")
+async def generate(body: GenerateBody):
+    engine = state["engine"]; tok = state["tokenizer"]
+    rid    = next(state["next_id"])
+    prompt_ids = tok(body.prompt, return_tensors="pt").input_ids[0].cuda()
+    detok = IncrementalDetokenizer(tok, prompt_ids)
+    req   = Request(id=rid, prompt_ids=prompt_ids,
+                    sampling_param=dict(temperature=body.temperature, top_k=body.top_k,
+                                        top_p=body.top_p, rep_penalty=body.rep_penalty),
+                    max_tokens=body.max_tokens, detok=detok)
+
+    out_q = asyncio.Queue()
+    engine.submit(GenRequest(req=req, out_q=out_q, loop=asyncio.get_running_loop()))
+
+    async def event_stream():
+        try:
+            while True:
+                piece = await out_q.get()
+                if piece is None:
+                    yield "data: [DONE]\n\n"; break
+                yield f"data: {json.dumps({'text': piece})}\n\n"
+        except asyncio.CancelledError:
+            engine.cancel(rid)         # tell engine to drop and free KV
+            raise
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}</code></pre>
+
+  <h3>Boot</h3>
+  <pre><code>uvicorn mini_sglang.server:app --host 0.0.0.0 --port 8000 --workers 1</code></pre>
+  <p><b>Always <code>--workers 1</code>.</b> Each worker would load its own 16 GiB model copy → OOM. Multi-worker scaling is a separate process per GPU + shared scheduler, beyond MVP scope.</p>
+
+  <h2>7.5 The SSE protocol</h2>
+  <p>Two formats in the wild; we use SSE for OpenAI compatibility:</p>
+  <pre><code>data: {"text": "Paris"}\n\n
+data: {"text": "."}\n\n
+data: {"text": " The"}\n\n
+...
+data: [DONE]\n\n</code></pre>
+  <p>Client parses with <code>fetch + ReadableStream</code> in browsers or <code>httpx.AsyncClient.stream</code> + <code>aiter_lines</code> in Python. The <code>data: [DONE]\n\n</code> terminator is OpenAI convention — many clients expect it.</p>
+
+  <h2>7.6 Five things to verify</h2>
+  <ol>
+    <li><b>Hello-world streaming:</b> <code>curl -N -X POST http://localhost:8000/generate -d '{"prompt":"The capital of France is","max_tokens":20}'</code> — tokens stream in as the model decodes, not as one blob.</li>
+    <li><b>Two concurrent requests share the scheduler:</b> fire two <code>curl</code>s in parallel; both complete in roughly the same time, not 2× single. Server logs should show mixed-batch steps.</li>
+    <li><b>Disconnect mid-stream:</b> kill a <code>curl</code> with Ctrl-C. Server doesn't crash. KV blocks freed (verified by VRAM print).</li>
+    <li><b><code>/health</code> independent of model:</b> even while <code>scheduler.step()</code> is mid-flight, <code>GET /health</code> returns in &lt;10ms. <b>This is the test that the event loop isn't blocked.</b> If it takes 30 ms, you've put the scheduler on the event-loop thread.</li>
+    <li><b>Memory stable across requests:</b> 100 sequential requests don't grow VRAM monotonically. KV blocks freed when requests finish.</li>
+  </ol>
+
+  <h2>7.7 Cancellation + KV cleanup</h2>
+  <p>When the client disconnects, FastAPI raises <code>asyncio.CancelledError</code>. Catch it and notify the engine:</p>
+  <pre><code>except asyncio.CancelledError:
+    engine.cancel(rid)
+    raise
+
+# in Engine:
+def cancel(self, rid):
+    self.cancelled.add(rid)
+
+# in _run, after step():
+for rid in list(self.cancelled):
+    self.scheduler.finish(rid)        # removes from running/waiting, frees KV
+    self.in_flight.pop(rid, None)
+    self.cancelled.discard(rid)</code></pre>
+  <p><b>Without this, generation keeps running for orphaned requests.</b> Wasted GPU and leaked KV.</p>
+
+  <p>And in the scheduler's writeback path, when a request becomes finished:</p>
+  <pre><code>self.alloc.free(req.blocks)
+req.blocks.clear()
+req.slot_indices.clear()</code></pre>
+
+  <h2>7.8 Pitfalls (table of eight)</h2>
+  <table>
+    <tr><th>pitfall</th><th>symptom</th></tr>
+    <tr><td>direct <code>.put_nowait()</code> into <code>asyncio.Queue</code> from other thread</td><td>works 95% of the time, deadlocks at scale</td></tr>
+    <tr><td><code>uvicorn --workers N</code> with N&gt;1</td><td>OOM (N × 16 GiB)</td></tr>
+    <tr><td>forget to free KV on request finish</td><td>gradual OOM after ~100 requests</td></tr>
+    <tr><td>run <code>step()</code> in executor without lock</td><td>concurrent KV writes → garbage</td></tr>
+    <tr><td>busy-spin scheduler loop when idle</td><td>one CPU core pegged at 100%</td></tr>
+    <tr><td><code>time.sleep</code> in engine thread</td><td>shutdown takes up to that duration</td></tr>
+    <tr><td><code>print()</code> in handler</td><td>blocks event loop on disk I/O; use <code>logging</code></td></tr>
+    <tr><td>return token IDs not text</td><td>client re-implements detokenizer; defeats L6</td></tr>
+  </table>
+
+  <h2>7.9 The smoke test</h2>
+  <pre><code># scripts/l7_smoke.py — 3 concurrent requests
+async def one(prompt, idx):
+    async with httpx.AsyncClient(timeout=120) as c:
+        async with c.stream("POST", URL, json={"prompt": prompt, "max_tokens": 30}) as r:
+            buf = ""; t0 = time.time(); ttft = None
+            async for line in r.aiter_lines():
+                if not line.startswith("data: "): continue
+                if line == "data: [DONE]": break
+                ttft = ttft or (time.time() - t0)
+                buf += json.loads(line[6:])["text"]
+            print(f"[{idx}] TTFT={ttft:.2f}s total={time.time()-t0:.2f}s")
+            return buf
+
+results = await asyncio.gather(
+    one("The capital of France is", 0),
+    one("Once upon a time",         1),
+    one("Python is",                2),
+)
+assert all(results)
+print("✅ L7 PASS")</code></pre>
+
+  <h2>7.10 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L7 pass criteria</span>
+    <ul style="margin:.4rem 0">
+      <li><code>uvicorn mini_sglang.server:app</code> boots, model loaded once.</li>
+      <li><code>curl localhost:8000/health</code> returns instantly even during generation.</li>
+      <li><code>curl -N localhost:8000/generate -d '{...}'</code> streams text fragments.</li>
+      <li>Two simultaneous <code>curl</code>s produce two valid streams, shared by the scheduler.</li>
+      <li><code>scripts/l7_smoke.py</code> passes.</li>
+      <li>Repeated requests don't grow VRAM.</li>
+    </ul>
+  </blockquote>
+
+  <p>After L7 lands you have a real product. L8 (radix prefix cache) and L9 (CUDA graphs) are throughput/latency optimisations on top.</p>
+
+  <div class="lesson-nav">
+    <a href="L6-tokenizer.html">← L6</a>
+    <a href="index.html">Home</a>
+  </div>
+</main>
+</body>
+</html>

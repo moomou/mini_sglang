@@ -1,4 +1,3 @@
-from idna import decode
 from mini_sglang.sampler import SamplingParams
 import torch
 from dataclasses import dataclass
@@ -31,6 +30,8 @@ class Scheduler:
         self.pool=  pool
         self.eos_id = eos_id
 
+        self.cancelled= set()
+
     def build_params(self, batch: list[tuple[Request, int]]) -> SamplingParams:
         return SamplingParams(
             temperature=torch.tensor([r.sampling_param["temperature"] for r, _ in batch], dtype=torch.float32, device='cuda'),
@@ -41,34 +42,60 @@ class Scheduler:
 
     def add_request(self, req: Request):
         self.waiting.append(req)
+    
+    def finish(self, rid: int):
+        self.cancelled.add(rid)
       
     def has_unfinished(self) -> bool:
         if len(self.waiting) > 0 or len(self.running) > 0:
             return True
         return False
 
-    def _build_input_ids(self, reqs: list[tuple[Request, int]]):
-        ...
+    def _build_input_ids(self, batch: list[tuple[Request, int]]):
+        flat = []
+        for req, q_len in batch:
+            if req.cur_len + q_len <= req.prompt_ids.numel():
+                flat.extend(req.prompt_ids[req.cur_len : req.cur_len + q_len].tolist())
+            else: 
+                flat.append(req.output_ids[-1])
 
-    def _build_slots(self, reqs: list[tuple[Request, int]]):
-        ...
-        slot = torch.tensor(req.slot_indices[:T], device="cuda", dtype=torch.long)
+        return torch.tensor(flat, device='cuda', dtype=torch.long)
 
-    def build_prev_ids(self, reqs: list[tuple[Request, int]]):
-        # torch.tensor([req.prompt_ids], device='cuda')
-        ...
+
+    def build_prev_ids(self, batch: list[tuple[Request, int]]):
+        # calculate max_prev size
+        max_prev = max([
+            req.prompt_ids.numel() + len(req.output_ids) 
+            for req, _ in batch
+        ])
+        # any int that's not in the vocab penalty math — for L5 with rep_penalty=1.0, anything works
+        PAD = 0
+        out = torch.full((len(batch), max_prev), PAD, dtype=torch.long, device='cuda')
+
+        for i, (req, _) in enumerate(batch):
+            hist = torch.concat([
+                req.prompt_ids, 
+                torch.tensor(
+                    req.output_ids, 
+                    dtype=req.prompt_ids.dtype, 
+                    device=req.prompt_ids.device,
+                )
+            ], dim=-1)
+            out[i, :hist.numel()] = hist
+
+        return out
 
     def _step(self, batch: list[tuple[Request, int]]):
-        for req, _ in batch:
-            T = req.cur_len
+        for req, q_len in batch:
+            T = req.cur_len + q_len
             reserve(req, self.alloc, T)
 
-        slots = self._build_slots(batch)
         meta = self.build_meta(batch)
         params = self.build_params(batch)
         prev_ids = self.build_prev_ids(batch)
+        input_ids = self._build_input_ids(batch)
 
-        logits = self.model(batch, self.pool, meta)
+        logits = self.model(input_ids, self.pool, meta)
 
         # remember, logits is (T_total, vocab)
         last_rows = (meta.cu_seqlens_q[1:] - 1).long()
@@ -80,41 +107,77 @@ class Scheduler:
             params, 
             prev_ids=prev_ids)
 
-        # TODO: build a mask to pick out the next_ids for each of the sequence in the batch
+        step_result = StepResult({}, finished=[])
         # then update req
         for i, next_id in enumerate(next_ids):
             req , q_len = batch[i]
-            req.output_ids.append(next_id.item())
+            next_id_detached= next_id.item()
+
+            req.output_ids.append(next_id_detached)
             req.cur_len += q_len
+
+            step_result.new_tokens[req.id] = next_id_detached
+
+            if next_id_detached == self.eos_id or len(req.output_ids) >= req.max_tokens:
+                step_result.finished.append(req.id)
+                self._release_req_blocks(req)
+            else:
+                self.running.append(req)
+
+        return step_result
+
+    def _release_req_blocks(self, req: Request):
+        self.cancelled.discard(req.id)
+        self.alloc.free(req.blocks)
+
+        req.blocks.clear()
+        req.slot_indices.clear()
 
     def step(self):
         decode_batch, prefill_batch = self.select()
 
         batch = prefill_batch + decode_batch
-        self._step(batch)
 
-        # TODO: return StepResult
+        if not batch:
+            return StepResult({}, [])
+
+        return self._step(batch)
 
 
     def select(self, target_batch_size=MAX_BATCH_PER_TURN) -> tuple[list[tuple[Request, int]], list[tuple[Request, int]]]:
         target_batch_size = min(target_batch_size, MAX_BATCH_PER_TURN)
+
         decode_batch = []
-        while len(self.running) and target_batch_size:
-            decode_batch.append((self.running.popleft(), 1))
+        # decode takes exactly 1 step
+        while len(self.running) and len(decode_batch) < target_batch_size:
+            req = self.running.popleft()
+            if req.id in self.cancelled:
+                self._release_req_blocks(req)
+                continue
+
+            decode_batch.append((req, 1))
 
         prefill_batch = []
         budget = MAX_TOKENS_PER_STEP - len(decode_batch) # decode is 1 token each
-        while self.waiting and budget > 0:
+        while self.waiting and budget > 0 and (len(decode_batch) + len(prefill_batch)) < target_batch_size:
             # waiting is prefill
             head = self.waiting[0]
             need = next_q_len(head)
 
+            if head.id in self.cancelled:
+                self._release_req_blocks(head)
+                self.waiting.popleft()
+                continue
+
             if need > budget:
+                # we dont have enough capacity to handle
                 break
-            if self.alloc.num_free_tokens() < need + 1: # plus 1 for generated token
+            if self.alloc.num_free_tokens() < (need + 1): # plus 1 for generated token
                 break
             
             prefill_batch.append((self.waiting.popleft(), need))
+
+            # we only process "need" but need plus 1 to save the generated token
             budget -= need
 
         return decode_batch, prefill_batch
@@ -147,5 +210,4 @@ class Scheduler:
             seq_lens_kv= torch.tensor(seq_lens_kv, device='cuda', dtype=torch.int32),
             block_table= torch.tensor(block_table_rows, device='cuda', dtype=torch.int32),
             block_size = self.alloc.block_size,
-            is_prefill = any(q_len > 1 for _, q_len in batch), # TODO: remove
         )

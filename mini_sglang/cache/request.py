@@ -1,5 +1,6 @@
 import torch
 from dataclasses import dataclass, field
+from mini_sglang.tokenizer import IncrementalDetokenizer
 
 @dataclass
 class ForwardMeta:
@@ -21,6 +22,7 @@ class ForwardMeta:
     kv_indices: torch.Tensor | None = None
     # for SDPA is_causal
     is_prefill: bool = False
+
 @dataclass
 class Request:
     id: int
@@ -32,6 +34,7 @@ class Request:
     output_ids: list[int] = field(default_factory=list)
     max_tokens: int = 20
     done: bool = False
+    detok: IncrementalDetokenizer | None = None
 
 def reserve(req: Request, alloc: 'BlockAllocator', target_len: int):
     """Ensure req has enough slots for target_len tokens. Allocates blocks as needed."""

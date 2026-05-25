@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L6 — Tokenizer + incremental detokenize · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+    <a href="L5-scheduler.html">L5</a>
+    <a href="L6-tokenizer.html">L6</a>
+    <a href="L7-server.html">L7</a>
+  </nav>
+</header>
+<main>
+  <h1>L6 — Tokenizer + incremental detokenize</h1>
+  <p class="meta">Stream text fragments out per token without re-decoding the full sequence each step.</p>
+
+  <h2>6.1 Why this is its own lesson</h2>
+  <p>L5's loop has <code>tokenizer.decode(outputs[rid])</code> at the end. Fine for batch jobs, broken for streaming servers. Two naïve approaches both fail:</p>
+  <ul>
+    <li><b>Decode each token alone, concatenate.</b> Breaks on multi-byte UTF-8. The Chinese char 你 is 3 bytes that a BPE tokenizer often splits across multiple tokens. <code>decode([single_byte_token])</code> → UnicodeDecodeError or silent <code>\ufffd</code>.</li>
+    <li><b>Decode the full history every step.</b> Correct but O(N²); visible above ~256 tokens.</li>
+  </ul>
+  <p>The right answer is a small window + diff trick, with one subtle correctness gap to handle.</p>
+
+  <h2>6.2 The window-diff algorithm</h2>
+  <pre><code>K = 4   # tokens ≥ max UTF-8 char in bytes
+
+class IncrementalDetokenizer:
+    def __init__(self, tokenizer, prompt_ids):
+        self.tokenizer   = tokenizer
+        self.tokens      = prompt_ids.tolist()
+        self.emitted_len = len(tokenizer.decode(prompt_ids, skip_special_tokens=False))
+
+    def push(self, new_token_id):
+        self.tokens.append(new_token_id)
+        start = max(0, len(self.tokens) - K)
+        window         = self.tokens[start:]
+        decoded_window = self.tokenizer.decode(window, skip_special_tokens=False)
+
+        if decoded_window.endswith("\ufffd"):
+            return ""                                            # still mid-char
+
+        prefix_text = self.tokenizer.decode(
+            self.tokens[start:-1], skip_special_tokens=False,
+        )
+        if "\ufffd" in prefix_text:
+            # the previous step had partial chars that this token resolved.
+            # window-diff is unreliable; fall back to the global cursor.
+            full = self.tokenizer.decode(self.tokens, skip_special_tokens=False)
+            new_text = full[self.emitted_len:]
+        else:
+            new_text = decoded_window[len(prefix_text):]
+
+        self.emitted_len += len(new_text)
+        return new_text
+
+    def flush(self):
+        final = self.tokenizer.decode(self.tokens, skip_special_tokens=False)
+        if len(final) == self.emitted_len:
+            return ""
+        out = final[self.emitted_len:]
+        self.emitted_len = len(final)
+        return out</code></pre>
+  <ul>
+    <li><b>Window of K=4 tokens.</b> Enough for any UTF-8 char (max 4 bytes).</li>
+    <li><b>Endswith check.</b> If the new window ends with the replacement char, we're mid-char globally — wait for more tokens.</li>
+    <li><b>Diff via <code>decode(window[:-1])</code>.</b> Fast path; the new text is the suffix difference.</li>
+    <li><b>Fallback when prefix has <code>\ufffd</code>.</b> See §6.3.</li>
+  </ul>
+
+  <h2>6.3 The subtle bug that bites every implementation</h2>
+  <p>Consider an emoji that splits into 3 BPE tokens, like <code>🫨</code> = <code>[9284, 104, 101]</code> in Qwen3:</p>
+  <pre><code>push(9284) -> ''       (decoded window ends with \ufffd, wait)
+push(104)  -> ''       (still mid-char)
+push(101)  -> ???      (emoji is now complete)</code></pre>
+  <p>Without the fallback at push 3:</p>
+  <pre><code>decoded_window = "<context>🫨"             (clean; does NOT end with \ufffd)
+prefix_text    = "<context>\ufffd\ufffd"  (two replacement chars for 2 partial bytes)
+new_text       = decoded_window[len(prefix_text):]
+               = "<context>🫨"[ len(context) + 2 :]
+               = "🫨"[1:]
+               = ""                       ← BUG: emoji never emits</code></pre>
+  <p>The diff math overshoots because <code>prefix_text</code> (N+2 chars) is <em>longer</em> than <code>decoded_window</code> (N+1 chars). The emoji would only appear at the next <code>flush()</code>.</p>
+  <p>The <code>if "\ufffd" in prefix_text</code> branch detects exactly this case and falls back to <code>full[emitted_len:]</code>, which is the ground-truth diff against what we actually emitted.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>If I see <code>\ufffd</code>, I don't emit and don't update <code>emitted_len</code>, right? Doesn't that handle it?</b>
+  </blockquote>
+  <p>Right that <code>emitted_len</code> isn't updated on no-emit. But the bug isn't about <code>emitted_len</code> — <code>push()</code> doesn't <em>use</em> <code>emitted_len</code> on the fast path. It re-derives the "previous state" by decoding <code>window[:-1]</code> from scratch each call. That re-derivation introduces spurious <code>\ufffd</code> chars (the byte-level replacement chars) that didn't exist in any text we actually emitted.</p>
+  <p>The <code>endswith</code> check correctly catches "the CURRENT window ends mid-char". It misses "the PREVIOUS window had <code>\ufffd</code>s that just got resolved" — that's where the diff math breaks. The fallback handles exactly that case.</p>
+
+  <h3>Verification</h3>
+  <pre><code>$ python /tmp/l6_proof.py
+push(9284) -> ''
+push(104)  -> ''
+push(101)  -> '🫨'     ← now emits at the resolving token
+flush()    -> ''       ← nothing left
+MATCH:     True</code></pre>
+
+  <h2>6.4 Edge cases</h2>
+  <ul>
+    <li><b>First call:</b> <code>emitted_len</code> initialised to prompt's decoded length, so we never emit prompt text to the client.</li>
+    <li><b>EOS:</b> when <code>tok_id == eos_id</code>, the scheduler marks finished. The detokenizer's <code>push()</code> for EOS typically returns <code>""</code> (decoded EOS is empty or a special marker). Pass <code>skip_special_tokens=False</code> if you want to see it on the wire.</li>
+    <li><b><code>flush()</code>:</b> matters when generation stops mid-UTF-8-char (model emits a partial char and then EOS). Drains the dangling bytes or emits the replacement.</li>
+  </ul>
+
+  <h2>6.5 Layering</h2>
+  <blockquote>
+    <span class="label">design</span>
+    The <b>scheduler does NOT touch the detokenizer.</b> Engine emits token IDs; the streaming layer (L7 HTTP) formats them. Keeps the scheduler off the hot path for string operations and lets L7 swap streaming protocols cleanly.
+  </blockquote>
+
+  <h2>6.6 Pitfalls (table of seven)</h2>
+  <table>
+    <tr><th>pitfall</th><th>symptom</th></tr>
+    <tr><td>decode single token at a time</td><td><code>UnicodeDecodeError</code> or silent <code>\ufffd</code> on CJK / emoji</td></tr>
+    <tr><td>decode full history each step</td><td>O(N²) latency visible above ~256 tokens</td></tr>
+    <tr><td><code>start = prefix_offset - K</code> (chars as token index)</td><td>window is empty, every push returns <code>""</code>, all output appears in <code>flush()</code></td></tr>
+    <tr><td>window-diff without the <code>\ufffd</code>-in-prefix fallback</td><td>multi-token UTF-8 chars never emit</td></tr>
+    <tr><td><code>skip_special_tokens=True</code> mid-stream</td><td>EOS / system markers silently vanish</td></tr>
+    <tr><td><code>clean_up_tokenization_spaces=True</code></td><td>text retroactively reformats; breaks deltas</td></tr>
+    <tr><td>put detokenizer inside scheduler</td><td>scheduler becomes hot path for string ops</td></tr>
+  </table>
+
+  <h2>6.7 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L6 pass criteria</span>
+    <ul style="margin:.4rem 0">
+      <li><code>IncrementalDetokenizer</code> exposes <code>__init__(tokenizer, prompt_ids)</code>, <code>push(tok) -> str</code>, <code>flush() -> str</code>.</li>
+      <li>Streamed text concatenated equals <code>tokenizer.decode(prompt + outputs)[len(prompt_text):]</code> exactly.</li>
+      <li>Multi-token UTF-8 chars (e.g. <code>🫨</code>) emit at the resolving token, not at <code>flush()</code>.</li>
+      <li>No <code>\ufffd</code> in streamed text for prompts containing CJK / emoji.</li>
+      <li>O(1)-ish per <code>push()</code> in the common case; worst case (fallback) is O(N).</li>
+    </ul>
+  </blockquote>
+
+  <div class="lesson-nav">
+    <a href="L5-scheduler.html">← L5</a>
+    <a href="L7-server.html">L7 — HTTP server →</a>
+  </div>
+</main>
+</body>
+</html>

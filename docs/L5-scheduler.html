@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L5 — Scheduler / continuous batching · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+    <a href="L5-scheduler.html">L5</a>
+    <a href="L6-tokenizer.html">L6</a>
+    <a href="L7-server.html">L7</a>
+  </nav>
+</header>
+<main>
+  <h1>L5 — Scheduler / continuous batching</h1>
+  <p class="meta">Multiple requests in one forward pass. Where most of the throughput comes from.</p>
+
+  <h2>5.1 The problem</h2>
+  <p>Three requests arrive on a busy server:</p>
+  <pre><code>t=0    req A arrives, prompt = 8 tokens
+t=10   req B arrives, prompt = 32 tokens   (A is mid-decode)
+t=15   req C arrives, prompt = 5 tokens    (A and B both mid-decode)</code></pre>
+  <p>A naïve "one request per forward call" server processes A fully, then B, then C. Tail latency is awful and the GPU sits idle during single-token decodes (Qwen3-8B's decode kernel utilises maybe 5–15% of an H100's compute).</p>
+  <p><b>Continuous batching:</b> every forward step, ask "who's runnable?" and pack them all into a single call. The model doesn't change. The KV pool doesn't change. What changes is the bookkeeping that builds <code>ForwardMeta</code> — instead of one request's worth, it's whatever's runnable, mixed.</p>
+  <pre><code>step 0:   prefill A (8 q tokens)         + nothing else
+step 1:   decode A (1)                   + prefill B (32 q tokens)
+step 2:   decode A (1) + decode B (1)    + prefill C (5 q tokens)
+step 3:   decode A (1) + decode B (1)    + decode C (1)
+…</code></pre>
+  <p>The kernel call shape goes from "one sequence at a time" to "packed batch of mixed q_lens" — which is exactly why we built <code>cu_seqlens_q</code> / <code>seq_lens_kv</code> / <code>block_table</code> in L3. <b>L5 is the consumer that justifies that design.</b></p>
+
+  <h2>5.2 The scheduler's public API</h2>
+  <p>Three methods. This is the surface every modern engine exposes to the server layer.</p>
+  <pre><code>class Scheduler:
+    def add_request(self, req: Request) -> None: ...
+    def step(self) -> StepResult: ...                 # one model forward
+    def has_unfinished(self) -> bool: ...
+
+@dataclass
+class StepResult:
+    new_tokens: dict[int, int]   # req_id → token sampled this step
+    finished:   list[int]        # req_ids that completed this step</code></pre>
+  <p>The server loop is then:</p>
+  <pre><code>while scheduler.has_unfinished() or pending:
+    while pending:
+        scheduler.add_request(pending.popleft())
+    out = scheduler.step()
+    for rid, tok in out.new_tokens.items():
+        stream_to_client(rid, tok)
+    for rid in out.finished:
+        close_stream(rid)</code></pre>
+
+  <h2>5.3 The two queues</h2>
+  <pre><code>            ┌──────────────┐  select admits up to MAX_BATCH
+new req ──► │ WAITING      │ ─────────────────────────────┐
+            │ (no KV yet)  │                              │
+            └──────────────┘                              ▼
+                                                  ┌──────────────┐
+            EOS / max_tokens ◄─── writeback ◄──── │ RUNNING      │
+                                                  │ (has KV; will │
+                                                  │  advance ≥ 1) │
+                                                  └──────────────┘</code></pre>
+  <p>WAITING requests need to be <b>prefilled</b>. RUNNING requests need to be <b>decoded</b>. Each step mixes some of both.</p>
+
+  <h2>5.4 Four scheduling decisions</h2>
+
+  <h3>A. Admission</h3>
+  <pre><code>def select(self):
+    decode_batch  = list(self.running)
+    prefill_batch = []
+    budget = MAX_TOKENS_PER_STEP - len(decode_batch)
+    while self.waiting and budget &gt; 0 and len(decode_batch)+len(prefill_batch) &lt; MAX_BATCH:
+        head = self.waiting[0]
+        need = len(head.prompt_ids)
+        if need &gt; budget: break
+        if self.alloc.num_free_tokens() &lt; need + 1: break
+        prefill_batch.append((self.waiting.popleft(), need))
+        budget -= need
+    return decode_batch, prefill_batch</code></pre>
+
+  <h3>B. Reservation</h3>
+  <p>For each request, reserve <code>cur_len + q_len</code> total slots (decode needs +1, prefill needs +q_len). Pre-check all allocations before touching the model — partial allocation leaves you on inconsistent state.</p>
+
+  <h3>C. Packing — the <code>ForwardMeta</code> builder</h3>
+  <pre><code>def build_meta(self, batch):
+    positions, slot_mapping, cu_seqlens_q, seq_lens_kv = [], [], [0], []
+    block_table_rows = []
+    max_blocks = max(len(r.blocks) for r, _ in batch)
+
+    for r, q_len in batch:
+        for p in range(r.cur_len, r.cur_len + q_len):
+            positions.append(p)
+            slot_mapping.append(r.slot_indices[p])
+        cu_seqlens_q.append(cu_seqlens_q[-1] + q_len)
+        seq_lens_kv.append(r.cur_len + q_len)
+        block_table_rows.append(r.blocks + [-1] * (max_blocks - len(r.blocks)))
+
+    return ForwardMeta(
+        positions    = torch.tensor(positions,    device='cuda', dtype=torch.long),
+        slot_mapping = torch.tensor(slot_mapping, device='cuda', dtype=torch.long),
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, device='cuda', dtype=torch.int32),
+        seq_lens_kv  = torch.tensor(seq_lens_kv,  device='cuda', dtype=torch.int32),
+        block_table  = torch.tensor(block_table_rows, device='cuda', dtype=torch.int32),
+        block_size   = self.alloc.block_size,
+    )</code></pre>
+  <p><b><code>is_prefill</code> dies here.</b> In a mixed batch, a single boolean has no global meaning. <code>attn_paged_torch</code> already handles per-seq causality via <code>q_len == kv_len</code>.</p>
+
+  <h3>D. Writeback</h3>
+  <p>The model returns <code>[T_total, vocab]</code> logits. Pick the last row of each sequence:</p>
+  <pre><code>last_rows = (meta.cu_seqlens_q[1:] - 1).long()      # [num_seqs]
+per_seq   = logits[last_rows]                       # [num_seqs, vocab]
+next_ids  = sampler(per_seq.float(), params, prev_ids)   # [num_seqs]
+
+for (r, q_len), tok in zip(batch, next_ids.tolist()):
+    r.output_ids.append(tok)
+    r.cur_len += q_len                              # NOT always +1
+    if tok == eos_id or len(r.output_ids) &gt;= r.max_tokens:
+        finished.append(r.id)
+    else:
+        self.running.append(r)                      # requeue!</code></pre>
+  <blockquote class="warn">
+    <span class="label">off-by-one trap</span>
+    <code>cur_len += q_len</code>, NOT <code>+= 1</code>. A prefill of 32 tokens advances <code>cur_len</code> from 0 to 32 in one step. A decode advances by 1.
+  </blockquote>
+
+  <h2>5.5 Per-request sampling params</h2>
+  <pre><code>def build_params(self, batch):
+    return SamplingParams(
+        temperature = torch.tensor([r.sampling_param["temperature"] for r,_ in batch],
+                                   dtype=torch.float32, device='cuda'),
+        top_k       = torch.tensor([r.sampling_param["top_k"]       for r,_ in batch],
+                                   dtype=torch.int32,   device='cuda'),
+        top_p       = torch.tensor([r.sampling_param["top_p"]       for r,_ in batch],
+                                   dtype=torch.float32, device='cuda'),
+        rep_penalty = torch.tensor([r.sampling_param["rep_penalty"] for r,_ in batch],
+                                   dtype=torch.float32, device='cuda'),
+    )</code></pre>
+  <p><code>prev_ids</code> is right-padded to a common length so the sampler's <code>gather</code> works:</p>
+  <pre><code>def build_prev_ids(self, batch):
+    max_prev = max(r.prompt_ids.numel() + len(r.output_ids) for r,_ in batch)
+    out = torch.full((len(batch), max_prev), 0, dtype=torch.long, device='cuda')
+    for i, (r, _) in enumerate(batch):
+        hist = torch.cat([r.prompt_ids,
+                          torch.tensor(r.output_ids, dtype=r.prompt_ids.dtype, device='cuda')])
+        out[i, :hist.numel()] = hist
+    return out</code></pre>
+
+  <h2>5.6 Q&amp;A from session</h2>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why <code>logits[-1:]</code> in L4? Are we ignoring the last position?</b>
+  </blockquote>
+  <p>Backwards — <code>[-1:]</code> <em>keeps</em> the last row (kept-dim slice). The rows we throw away are 0..T-2, which predict tokens the prompt already provided (teacher-forced). Sampling them would be wasted compute — we only care what the model says about the next token.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>In L5 with a batch dim, do we do <code>logits[:, -1:]</code>?</b>
+  </blockquote>
+  <p>No — our engine uses <b>packed/varlen</b> layout, not padded batch. Logits is <code>[T_total, vocab]</code>, no batch axis. We pick per-seq last rows with <code>logits[(cu_seqlens_q[1:] - 1).long()]</code>. Walked through with <code>q_lens=[5,1,3]</code>: <code>cu_seqlens_q=[0,5,6,9]</code> → pick rows <code>[4,5,8]</code> of the <code>[9, vocab]</code> tensor.</p>
+
+  <h3>The shape, visualised</h3>
+  <pre><code>q_lens          = [5, 1, 3]                    # 3 sequences
+T_total         = 9
+logits.shape    = [9, vocab]
+
+row index:   0  1  2  3  4  | 5 |  6  7  8
+belongs to:  A  A  A  A  A  | B |  C  C  C
+                          ↑    ↑          ↑
+                       last  last      last
+
+cu_seqlens_q       = [0, 5, 6, 9]
+cu_seqlens_q[1:]-1 = [4, 5, 8]                  ← gather indices
+
+logits[[4, 5, 8]]  →  shape [3, vocab]          ← per-seq last-row logits
+sampler(...)       →  shape [3]                 ← one token per request</code></pre>
+
+  <h2>5.7 Pitfalls (table of nine)</h2>
+  <table>
+    <tr><th>pitfall</th><th>symptom</th></tr>
+    <tr><td><code>cur_len += 1</code> always</td><td>state drifts on prefill steps</td></tr>
+    <tr><td>not bumping <code>cur_len</code> before next <code>select</code></td><td>infinite re-prefill</td></tr>
+    <tr><td>using <code>output_ids[-1]</code> for prefills</td><td>wrong: prefills consume next chunk of prompt</td></tr>
+    <tr><td><code>block_table</code> padded with a valid block id</td><td>kernel reads other request's KV (defensive bug)</td></tr>
+    <tr><td>selecting decodes whose <code>cur_len</code> already advanced</td><td>double-write to same slot</td></tr>
+    <tr><td><code>prev_ids</code> length mismatch row-to-row</td><td>sampler <code>gather</code> crashes</td></tr>
+    <tr><td><code>eos_id</code> confused with <code>pad_id</code></td><td>premature stop</td></tr>
+    <tr><td><code>logits[-1:]</code> with multi-seq batch</td><td>only the last sequence's token gets sampled</td></tr>
+    <tr><td>reserve uses <code>cur_len</code> not <code>cur_len + q_len</code></td><td>fresh prefill reserves zero slots → IndexError</td></tr>
+  </table>
+
+  <h2>5.8 The batch-invariance problem (verified)</h2>
+  <p>Greedy outputs from a multi-request batch can differ from solo runs because <b>cuBLAS picks different matmul algorithms based on the input shape</b>. A <code>[5, hidden]</code> matmul and a <code>[15, hidden]</code> matmul have different reduction orders → ULP-scale fp drift → argmax flips when two top logits are close.</p>
+  <p>Demonstrated in the session: prompt 0 ("capital of France") run alone matches the L1-L4 reference exactly. Run in a batch of 3, it diverges at token 5 (Italy instead of France). Prompt 2 (longest, last) matches in both because its row is the last row of the whole tensor — exactly the layout the single-seq case sees.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>How do we achieve true deterministic parity?</b>
+  </blockquote>
+  <p>Three layers:</p>
+  <ol>
+    <li><b>Env + flags</b> (run-to-run reproducibility, ~5–15% perf):
+      <pre><code>os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+torch.use_deterministic_algorithms(True, warn_only=True)
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False</code></pre></li>
+    <li><b>SDPA pin to MATH backend</b> (attention batch invariance, 2–5× slower attention):
+      <pre><code>torch.backends.cuda.enable_flash_sdp(False)
+torch.backends.cuda.enable_mem_efficient_sdp(False)
+torch.backends.cuda.enable_math_sdp(True)</code></pre></li>
+    <li><b>Pad projections to M_max</b> or custom Triton kernels (projection batch invariance). Expensive, beyond curriculum.</li>
+  </ol>
+  <p><b>Honest reality:</b> no production engine (vLLM, SGLang, TRT-LLM, DeepSpeed) fully achieves bit-equal batched parity. It's a verification-time tool, not a production capability. SGLang has open tickets on batch invariance.</p>
+
+  <h2>5.9 Acceptance</h2>
+  <blockquote class="ok">
+    <span class="label">L5 pass criteria (the right ones)</span>
+    <ul style="margin:.4rem 0">
+      <li>A. Solo-through-scheduler matches L1–L4 reference bit-for-bit (verified ✓).</li>
+      <li>B. Batched run produces coherent text per request and the right token count.</li>
+      <li>C. At least one mixed prefill+decode step occurred.</li>
+    </ul>
+    Bit-equality across batched vs solo is the wrong test — see §5.8.
+  </blockquote>
+
+  <div class="lesson-nav">
+    <a href="L4-sampler.html">← L4</a>
+    <a href="L6-tokenizer.html">L6 — Tokenizer →</a>
+  </div>
+</main>
+</body>
+</html>
