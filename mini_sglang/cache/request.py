@@ -1,3 +1,4 @@
+from mini_sglang.cache.block_alloc import AllocFailure
 import torch
 from dataclasses import dataclass, field
 from mini_sglang.tokenizer import IncrementalDetokenizer
@@ -36,8 +37,9 @@ class Request:
     done: bool = False
     detok: IncrementalDetokenizer | None = None
 
-def reserve(req: Request, alloc: 'BlockAllocator', target_len: int):
+def reserve(req: Request, alloc: 'BlockAllocator', target_len: int, cache=None):
     """Ensure req has enough slots for target_len tokens. Allocates blocks as needed."""
+
     # convert target-len (per token) into blocks
     target_block = (
         target_len + (alloc.block_size - 1)
@@ -46,9 +48,18 @@ def reserve(req: Request, alloc: 'BlockAllocator', target_len: int):
 
     if current_block < target_block:
         diff = target_block - current_block
-        blocks = alloc.alloc_blocks(diff)
-        req.blocks.extend(blocks)
 
+        try: 
+            blocks = alloc.alloc_blocks(diff)
+        except AllocFailure:
+            if cache:
+                # try to free up to diff and then try alloc again
+                cache.evict(diff)
+                blocks = alloc.alloc_blocks(diff)
+            else:
+                raise
+
+        req.blocks.extend(blocks)
         for b in blocks:
             base = b * alloc.block_size
             req.slot_indices.extend(range(base, base + alloc.block_size))

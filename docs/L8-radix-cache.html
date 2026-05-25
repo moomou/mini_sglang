@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>L8 — Radix prefix cache · mini_sglang</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="topbar">
+  <span class="title">mini_sglang</span>
+  <nav>
+    <a href="index.html">Home</a>
+    <a href="L0-architecture.html">L0</a>
+    <a href="L1-model-weights.html">L1</a>
+    <a href="L2-paged-kv.html">L2</a>
+    <a href="L3-paged-attention.html">L3</a>
+    <a href="L4-sampler.html">L4</a>
+    <a href="L5-scheduler.html">L5</a>
+    <a href="L6-tokenizer.html">L6</a>
+    <a href="L7-server.html">L7</a>
+    <a href="L8-radix-cache.html">L8</a>
+  </nav>
+</header>
+<main>
+  <h1>L8 — Radix prefix cache</h1>
+  <p class="meta">The defining sglang trick. When two requests share a prefix, reuse the prefix's KV instead of re-computing it.</p>
+
+  <h2>8.1 The win, quantified</h2>
+  <p>Chat workloads have a system prompt at the start of every request. Without prefix caching every request re-prefills those 500 tokens. With prefix caching they're prefilled <em>once</em>; subsequent requests bump the refcount and start from the cached KV.</p>
+  <p>Verified on Qwen3-8B with a 97-token shared prefix + 5 unmatched tail tokens:</p>
+  <pre><code>WITH cache:   ext run = 25 q tokens in 20 steps   ← only 6 unmatched tail tokens prefilled
+                                                    + 19 decodes × 1 token = 25 total
+BASELINE:     ext run = 121 q tokens in 20 steps  ← full 102-token re-prefill + 19 decodes
+
+✓ cache saved 96 q tokens (79.3% of baseline prefill compute)
+✓ cached output bit-identical to baseline</code></pre>
+
+  <h2>8.2 The data structure: radix tree of token sequences</h2>
+  <p>Compressed trie keyed by token IDs. Each node = (a run of tokens, the KV blocks for those tokens, dict of children keyed by first-token, parent, LRU timestamp).</p>
+  <div class="diagram">
+                          root (tokens=[], blocks=[])
+                                │
+                  ┌─────────────┴─────────────┐
+                  │                           │
+            [12, 45, 17, ...]            [99, 3, 8, ...]
+            500 tokens, 32 blocks        200 tokens, 13 blocks
+            "system prompt"              "different system prompt"
+                  │
+        ┌─────────┴─────────┐
+        │                   │
+   [42, 7, ...]          [88, 1, ...]
+   user A's turn 1       user B's turn 1
+  </div>
+  <p>Three operations: <b>match</b>, <b>insert</b>, <b>evict</b>.</p>
+
+  <h2>8.3 The central invariant: block refcounting</h2>
+  <p>Every block has a refcount = (active requests holding it) + (radix-tree nodes referencing it).</p>
+  <pre><code>class BlockAllocator:
+    refcount: list[int]                  # NEW
+
+    def alloc_blocks(self, n):
+        ...
+        for b in out: self.refcount[b] = 1
+        return out
+
+    def incref(self, blocks):
+        for b in blocks: self.refcount[b] += 1
+
+    def decref(self, blocks):
+        freed = 0
+        for b in blocks:
+            self.refcount[b] -= 1
+            if self.refcount[b] == 0:
+                self.free_blocks.append(b)
+                freed += 1
+        return freed</code></pre>
+  <p><b>Replace every <code>alloc.free(...)</code> in the codebase with <code>alloc.decref(...)</code>.</b> This is the most invasive part of L8 — when the cache also holds a ref, decref keeps the block alive.</p>
+
+  <h2>8.4 Why a radix tree (not a hashmap)</h2>
+  <ol>
+    <li><b>Sub-prefix matching.</b> If you cached "A B C D" and a new request asks "A B C X", you reuse "A B C". A hashmap matches whole keys; a radix tree matches the longest prefix.</li>
+    <li><b>Incremental insertion + structural sharing.</b> A new request with prompt "A B C E" extends an existing "A B C" node without re-storing the prefix.</li>
+  </ol>
+
+  <h2>8.5 The match algorithm (1 _common_prefix_len call per descent)</h2>
+  <p>In a radix tree no two siblings share a first token (otherwise they'd be merged into a common parent). So children are keyed by first-token in a dict; lookup is O(1):</p>
+  <pre><code>def match(self, token_ids):
+    node = self.root
+    out_blocks, matched = [], 0
+    while matched &lt; len(token_ids):
+        first = token_ids[matched]
+        child = node.children.get(first)            # O(1) — radix property
+        if child is None: break
+
+        cp = self._common_prefix_len(child.tokens, token_ids[matched:])
+        child.last_access_time = time.time()
+
+        if cp == len(child.tokens):
+            out_blocks.extend(child.blocks)
+            matched += cp
+            node = child                            # full child match — descend
+        else:
+            blk = cp // self.alloc.block_size
+            out_blocks.extend(child.blocks[:blk])
+            matched += cp
+            break                                   # partial match — done
+    if out_blocks:
+        self.alloc.incref(out_blocks)               # caller takes ownership
+    return out_blocks, matched</code></pre>
+  <p>Per descent: <b>exactly one</b> <code>_common_prefix_len</code> call. The original implementation had three (self check + per-child loop + redundant recursion). For deep trees + wide siblings, this is the right asymptotics.</p>
+
+  <h2>8.6 Block alignment and the rounding direction</h2>
+  <p>The cache only stores <b>block-aligned</b> prefixes. <code>_common_prefix_len</code> rounds <em>down</em>:</p>
+  <pre><code>bs = self.alloc.block_size
+return bs * (i // bs)             # ROUND DOWN to block boundary</code></pre>
+  <blockquote class="warn">
+    <span class="label">silent-corruption pitfall</span>
+    Writing <code>bs * ((i + 1) // bs)</code> by mistake rounds UP and claims tokens match that actually diverged. Demonstrated in L8 review:
+    <code>match([1,2,3,99])</code> against cached <code>[1,2,3,5]</code> returned <code>([5,7], 4)</code> instead of <code>([5], 2)</code> — caller silently uses block 7 holding the wrong token.
+  </blockquote>
+
+  <h2>8.7 _split — the partition operation</h2>
+  <p>When a new prompt partially matches a cached node, split it. The node becomes the matched head; a new <code>split_node</code> holds the tail (and inherits the original's children, with parent pointers updated):</p>
+  <pre><code>def _split(self, node, k):                                # k must be block-aligned
+    blk_idx = k // self.alloc.block_size
+    head_tokens,  tail_tokens  = node.tokens[:k],  node.tokens[k:]
+    head_blocks,  tail_blocks  = node.blocks[:blk_idx], node.blocks[blk_idx:]
+
+    split_node = Node(
+        tokens=tail_tokens, blocks=tail_blocks,
+        children=node.children,                           # tail takes the subtree
+        parent=node, ...
+    )
+    for grandchild in split_node.children.values():
+        grandchild.parent = split_node                    # ← critical: re-parent
+
+    node.tokens   = head_tokens
+    node.blocks   = head_blocks
+    node.children = {split_node.tokens[0]: split_node}    # new dict, not the old one
+    return node                                           # the head</code></pre>
+  <blockquote class="warn">
+    <span class="label">aliasing pitfall</span>
+    Sharing <code>children</code> dict references between head and tail, or setting <code>node.children = [split_node]</code> (a <em>list</em> instead of a dict), or forgetting to update grandchildren's parent pointers — each is a silent topology corruption that the L8 review caught in turn.
+  </blockquote>
+
+  <h2>8.8 Scheduler integration</h2>
+  <p>Three changes:</p>
+  <pre><code># 1. add_request: lookup + populate slot_indices from cached blocks
+def add_request(self, req):
+    if self.cache:
+        cached_blocks, matched_len = self.cache.match(req.prompt_ids.tolist())
+        req.blocks   = list(cached_blocks)
+        req.cur_len  = matched_len
+        bs = self.alloc.block_size
+        for b in cached_blocks:                               # ← critical
+            req.slot_indices.extend(range(b * bs, b * bs + bs))
+    self.waiting.append(req)
+
+# 2. on finish: insert full token sequence into cache, then decref request's ref
+if next_id == self.eos_id or len(req.output_ids) &gt;= req.max_tokens:
+    finished.append(req.id)
+    if self.cache:
+        self.cache.insert(req.prompt_ids.tolist() + req.output_ids, req.blocks)
+    self.alloc.decref(req.blocks)                              # not alloc.free
+
+# 3. on OOM: try eviction before raising
+def alloc_with_evict(n):
+    needed = n - len(alloc.free_blocks)
+    if needed &gt; 0:
+        cache.evict(needed)
+    return alloc.alloc_blocks(n)</code></pre>
+  <blockquote class="hint">
+    <span class="label">subtle bug</span>
+    Forgetting to populate <code>req.slot_indices</code> from <code>cached_blocks</code> leaves the list empty while <code>cur_len &gt; 0</code>. Then <code>build_meta</code> later does <code>r.slot_indices[p]</code> for <code>p = cur_len, cur_len+1, ...</code> → <code>IndexError</code>. This bit our smoke on B.2; the fix is the inner <code>for b in cached_blocks: req.slot_indices.extend(...)</code>.
+  </blockquote>
+
+  <h2>8.9 Eviction: descending-level, LRU-within-level</h2>
+  <pre><code>def evict(self, n_blocks):
+    levels = sorted(self.node_by_level.keys())
+    while n_blocks &gt; 0 and levels:
+        level = levels.pop()                         # deepest first
+        nodes = sorted(self.node_by_level[level], key=lambda n: n.last_access_time)
+        if not nodes: continue
+        for i, n in enumerate(nodes):
+            freed = self.alloc.decref(n.blocks)
+            first = n.tokens[0]
+            if first in n.parent.children:
+                del n.parent.children[first]         # disconnect from tree
+            n_blocks -= freed
+            if n_blocks &lt;= 0: break
+        self.node_by_level[level] = nodes[i+1:]</code></pre>
+  <p>Two design choices:</p>
+  <ul>
+    <li><b>Descending level.</b> Deepest level is always leaves (by tree definition). After evicting all leaves at level L, level L-1 nodes become the new leaves — their <code>level</code> field doesn't change but they ARE leaves now. The next outer iteration processes them. No need to re-index.</li>
+    <li><b>Not strict LRU.</b> Shallow nodes (system prompts, shared bases) are protected; deep leaves (per-request tails) evict first. Real sglang does the same — favours keeping shorter, more-shareable prefixes.</li>
+  </ul>
+
+  <h2>8.10 Q&amp;A from session</h2>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Eviction worries me — when I wipe all leaves, the parents become leaves but their level field doesn't change. Won't they be orphaned in <code>node_by_level</code>?</b>
+  </blockquote>
+  <p>No — and you were right, I was wrong initially. The level field stays at L-1; the node is still indexed in <code>node_by_level[L-1]</code>. The outer loop pops levels descending, so after exhausting level L it visits L-1 and finds those nodes (now leaves). Promotion is implicit.</p>
+
+  <blockquote class="q">
+    <span class="label">student question</span>
+    <b>Why do we call <code>_common_prefix_len</code> three times to visit a child?</b>
+  </blockquote>
+  <p>The original recursive form did: 1 against current node + N against each child to pick best + 1 redundant inside the recursion entering the chosen child. The radix-tree-correct form is one dict lookup + one <code>_common_prefix_len</code> per descent. See §8.5.</p>
+
+  <h2>8.11 Pitfalls table (real ones we hit)</h2>
+  <table>
+    <tr><th>pitfall</th><th>symptom</th></tr>
+    <tr><td>round UP in <code>_common_prefix_len</code></td><td>match claims more tokens than actually agree → caller uses block holding wrong tokens → silent KV corruption</td></tr>
+    <tr><td>set <code>node.child = [...]</code> instead of <code>node.children = {...}</code></td><td>typo creates a new dataclass attribute; original .children untouched; subtree silently orphaned</td></tr>
+    <tr><td>list-comprehension on dict in evict</td><td>iterates keys not values; filter is no-op; node never removed → next match hits a recycled block</td></tr>
+    <tr><td>insert slices blocks by token count</td><td><code>blocks[cp_len:]</code> when <code>cp_len</code> is tokens; should be <code>blocks[cp_len // bs:]</code></td></tr>
+    <tr><td>missing incref on match/insert</td><td>cache holds a ref the allocator doesn't know about; evict frees a block another request is reading → garbage</td></tr>
+    <tr><td>insert silently drops "redundant" caller blocks</td><td>caller's refcount on the dropped block leaks until request finishes; document the contract or have insert return them</td></tr>
+    <tr><td>scheduler forgets to populate <code>slot_indices</code> from cached blocks</td><td><code>build_meta</code> IndexErrors at the first cached-position lookup</td></tr>
+    <tr><td>_split doesn't re-parent transferred grandchildren</td><td>evict walks <code>n.parent</code> up the wrong chain → deletes the wrong dict entry</td></tr>
+  </table>
+
+  <h2>8.12 What we skipped vs production</h2>
+  <table>
+    <tr><th>feature</th><th>real sglang</th><th>us</th></tr>
+    <tr><td>Per-token (un-aligned) caching</td><td>yes</td><td>block-aligned only</td></tr>
+    <tr><td>Hierarchical (CPU offload / HiCache)</td><td>yes</td><td>no</td></tr>
+    <tr><td>Cache-aware scheduling (prioritize high-hit requests)</td><td>yes</td><td>FCFS</td></tr>
+    <tr><td>Hot-set protection in eviction</td><td>yes</td><td>basic descending-level LRU</td></tr>
+    <tr><td>Cross-tenant isolation</td><td>configurable</td><td>single tenant</td></tr>
+  </table>
+  <p>MVP is ~250 LOC of new code. Captures roughly 80% of the throughput win for chat workloads.</p>
+
+  <h2>8.13 Acceptance (verified)</h2>
+  <blockquote class="ok">
+    <span class="label">L8 PASS</span>
+    <ul style="margin:.4rem 0">
+      <li><b>Phase A (units):</b> empty match, exact match, partial-at-odd-token (regression), insert-with-split + 4 post-split matches, no false hits, eviction actually frees.</li>
+      <li><b>Phase B (e2e):</b> cached run uses 25 q tokens vs 121 baseline (79.3% saved) for the same prompt. Output bit-identical.</li>
+      <li><b>Phase C:</b> unrelated prompt → matched_len=0.</li>
+    </ul>
+  </blockquote>
+
+  <div class="lesson-nav">
+    <a href="L7-server.html">← L7</a>
+    <a href="index.html">Home</a>
+  </div>
+</main>
+</body>
+</html>

@@ -19,6 +19,7 @@
     <a href="L5-scheduler.html">L5</a>
     <a href="L6-tokenizer.html">L6</a>
     <a href="L7-server.html">L7</a>
+    <a href="L8-radix-cache.html">L8</a>
   </nav>
 </header>
 <main>
@@ -97,12 +98,12 @@ python -m scripts.l1_smoke   # verify L1 still passes
       <p>FastAPI + asyncio glue. <code>/generate</code> end-to-end.</p>
       <span class="status done">done</span>
     </a>
-    <div class="lesson-card" style="opacity:.6">
+    <a class="lesson-card" href="L8-radix-cache.html">
       <span class="num">L8</span>
-      <h3>Radix prefix cache <span style="color:var(--muted);font-weight:400">(stretch)</span></h3>
-      <p>Reuse KV across requests with shared prefixes. The defining sglang trick.</p>
-      <span class="status todo">stretch</span>
-    </div>
+      <h3>Radix prefix cache</h3>
+      <p>Reuse KV across requests with shared prefixes. The defining sglang trick. 79% prefill compute saved on chat-style workloads.</p>
+      <span class="status done">done</span>
+    </a>
     <div class="lesson-card" style="opacity:.6">
       <span class="num">L9</span>
       <h3>CUDA graphs decode <span style="color:var(--muted);font-weight:400">(stretch)</span></h3>

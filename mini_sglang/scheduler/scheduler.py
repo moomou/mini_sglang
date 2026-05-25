@@ -1,3 +1,4 @@
+from mini_sglang.cache.block_alloc import AllocFailure
 from mini_sglang.sampler import SamplingParams
 import torch
 from dataclasses import dataclass
@@ -20,7 +21,7 @@ class StepResult:
     finished: list[int] # req_ids completed 
 
 class Scheduler:
-    def __init__(self, model, sampler, alloc, pool, eos_id):
+    def __init__(self, model, sampler, alloc, pool, eos_id, cache=None):
         self.running: deque[Request] = deque()
         self.waiting: deque[Request] = deque()
 
@@ -29,6 +30,7 @@ class Scheduler:
         self.alloc = alloc
         self.pool=  pool
         self.eos_id = eos_id
+        self.cache = cache
 
         self.cancelled= set()
 
@@ -41,6 +43,15 @@ class Scheduler:
         )
 
     def add_request(self, req: Request):
+        if self.cache:
+            cached_blocks, matched_len = self.cache.match(req.prompt_ids.tolist())
+            req.blocks = list(cached_blocks)
+            req.cur_len = matched_len
+            # also need to udpate slots
+            bs = self.alloc.block_size
+            for b in cached_blocks:
+                req.slot_indices.extend(range(b * bs, b * bs + bs))
+
         self.waiting.append(req)
     
     def finish(self, rid: int):
@@ -88,7 +99,7 @@ class Scheduler:
     def _step(self, batch: list[tuple[Request, int]]):
         for req, q_len in batch:
             T = req.cur_len + q_len
-            reserve(req, self.alloc, T)
+            reserve(req, self.alloc, T, cache=self.cache)
 
         meta = self.build_meta(batch)
         params = self.build_params(batch)
@@ -120,6 +131,11 @@ class Scheduler:
 
             if next_id_detached == self.eos_id or len(req.output_ids) >= req.max_tokens:
                 step_result.finished.append(req.id)
+
+                if self.cache is not None:
+                    full_tokens = req.prompt_ids.tolist() + req.output_ids
+                    self.cache.insert(full_tokens, req.blocks)
+
                 self._release_req_blocks(req)
             else:
                 self.running.append(req)
@@ -128,7 +144,7 @@ class Scheduler:
 
     def _release_req_blocks(self, req: Request):
         self.cancelled.discard(req.id)
-        self.alloc.free(req.blocks)
+        self.alloc.decref(req.blocks)
 
         req.blocks.clear()
         req.slot_indices.clear()
