@@ -39,35 +39,55 @@ flash-attn is **not needed for Lessons 1–2**. The L1 baseline uses `torch.nn.f
 mini_sglang/
 ├── pyproject.toml
 ├── README.md
+├── docs/                          # static HTML lesson pages (L0–L8)
 ├── mini_sglang/
 │   ├── __init__.py
-│   ├── config.py              # ModelConfig, ServerArgs (L1)
-│   ├── weights.py             # safetensors loader (L1)
+│   ├── config.py                  # ModelConfig (L1)
+│   ├── weights.py                 # safetensors loader (L1)
+│   ├── sampler.py                 # greedy / temp / top-p / rep penalty (L4)
+│   ├── tokenizer.py               # incremental UTF-8 detok (L6)
+│   ├── engine.py                  # background loop bridging scheduler ↔ HTTP (L7)
+│   ├── server.py                  # FastAPI /generate (L7)
 │   ├── model/
-│   │   ├── layers.py          # RMSNorm, SwiGLU MLP, RoPE (L1)
-│   │   └── qwen3.py           # Qwen3ForCausalLM eager forward (L1)
+│   │   ├── layers.py              # RMSNorm, SwiGLU MLP, RoPE (L1)
+│   │   └── qwen3.py               # Qwen3ForCausalLM forward (L1+, paged from L3)
 │   ├── cache/
-│   │   └── kv_pool.py         # block allocator + page tables (L2)
-│   ├── scheduler/
-│   │   ├── request.py         # Req state machine (L5)
-│   │   ├── batch.py           # ScheduleBatch / ForwardBatch (L5)
-│   │   └── scheduler.py       # FCFS continuous batcher (L5)
-│   ├── runner/
-│   │   ├── model_runner.py    # forward() driver (L3)
-│   │   └── sampler.py         # greedy / temp / top-p (L4)
-│   └── io/
-│       ├── tokenizer.py       # incremental UTF-8 detok (L6)
-│       └── server.py          # FastAPI /generate (L7)
-├── scripts/
-│   └── l1_smoke.py            # greedy 20 tokens, asserts == HF
-└── tests/
+│   │   ├── block_alloc.py         # block allocator (L2)
+│   │   ├── kv_pool.py             # paged KV pool (L2)
+│   │   ├── request.py             # Request + ForwardMeta (L2/L5)
+│   │   └── radix_cache.py         # prefix radix cache (L8)
+│   └── scheduler/
+│       └── scheduler.py           # FCFS continuous batcher (L5)
+└── scripts/
+    ├── l1_smoke.py                # greedy 20 tokens, asserts == HF (L1)
+    ├── l2_smoke.py                # same parity check on paged KV (L2)
+    ├── l3_smoke.py                # paged attention parity (L3)
+    ├── l4_smoke.py                # sampler (L4)
+    ├── l5_smoke.py                # scheduler / continuous batching (L5)
+    ├── l6_smoke.py                # incremental detok across CJK + emoji (L6)
+    ├── l7_smok.py                 # FastAPI server, 3 concurrent streams (L7)
+    └── l8_smoke.py                # radix prefix cache unit + e2e (L8)
 ```
 
-## Lesson 1 quickstart
+## Smoke tests
+
+The model path defaults to `/media/2nvme/llm/Qwen3-8B`. Override with `MODEL_DIR=...`.
+
+The latest smoke test (currently `l8_smoke.py`) is the one that exercises the
+current code end-to-end:
 
 ```bash
-# after `uv sync`
-python -m scripts.l1_smoke    # should print 20 tokens and "✅ L1 PASS"
+# after `uv sync`  (and `uv pip install -e ".[flash]"` for L3+)
+python -m scripts.l8_smoke        # full radix-cache test, requires GPU + model
+L8_SKIP_MODEL=1 python -m scripts.l8_smoke   # Phase A unit tests only, no GPU needed
 ```
 
-The model path is hardcoded to `/media/2nvme/llm/Qwen3-8B`. Override with `MODEL_DIR=...`.
+> ⚠️ **Caution: earlier smoke tests are frozen against older APIs and will
+> not all run against `main`.** Each lesson moves the internal API forward
+> (e.g. the model went from `model(ids, positions, kv_caches, ...)` in L1 to
+> `model(ids, pool, ForwardMeta)` from L2 onward; `ForwardMeta` then gained
+> `cu_seqlens_q` / `seq_lens_kv` / `block_table` at L3, etc.). The scripts
+> under `scripts/` are kept as historical checkpoints of what each lesson
+> shipped, not as a regression suite. **Only the latest `lN_smoke.py` is
+> guaranteed to run against the current code.** Older ones may fail to
+> import or raise `TypeError` on the model call.
